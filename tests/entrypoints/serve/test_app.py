@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 from fastapi.testclient import TestClient
 
+from x_tokens.config import ExecutorConfig, ModelConfig, ParallelConfig, XTokensConfig
 from x_tokens.core.scheduler import SchedulerOutput
 from x_tokens.engine.input_processor import InputProcessor
 from x_tokens.engine.output_processor import OutputProcessor
@@ -256,3 +257,26 @@ def test_default_factory_ignores_eos_until_max_tokens(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["choices"][0]["finish_reason"] == "length"
     assert response.json()["usage"]["completion_tokens"] == 2
+
+
+def test_custom_factory_uses_registered_model_runner(monkeypatch) -> None:
+    monkeypatch.setattr(
+        serve_app.TokenizerInputProcessor,
+        "from_config",
+        lambda *args, **kwargs: FakeInputProcessor(),
+    )
+    registered_factory = Mock(return_value=FakeExecutor())
+    monkeypatch.setattr(
+        "x_tokens.executor.custom_factory.create_registered_model_executor",
+        registered_factory,
+    )
+    config = XTokensConfig(
+        model_config=ModelConfig(served_model_name="test-model"),
+        executor_config=ExecutorConfig(backend="custom"),
+        parallel_config=ParallelConfig(devices=("cpu",), collective_backend="gloo"),
+    )
+
+    engine = serve_app.default_engine_factory(config)
+
+    registered_factory.assert_called_once_with(config, 0, frozenset({9}))
+    asyncio.run(engine.close())

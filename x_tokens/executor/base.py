@@ -30,5 +30,6 @@ class ModelForwardOutput:
     order. Optional model state is reserved for future KV-cache executors.
     """
 
-    logits: Any
+    logits: Any = None
     past_key_values: Any | None = None
+    runner_step_id: Any | None = None

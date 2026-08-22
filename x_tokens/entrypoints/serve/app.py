@@ -33,6 +33,7 @@ from .renderer import PlainTextPromptRenderer
 
 EngineFactory = Callable[[XTokensConfig], LLMEngineProtocol]
 ExecutorFactory = Callable[[NaiveHFExecutorConfig], Executor]
+CustomExecutorFactory = Callable[[XTokensConfig, int, frozenset[int]], Executor]
 logger = init_logger(__name__)
 
 
@@ -71,6 +72,7 @@ def default_engine_factory(
     config: XTokensConfig,
     *,
     executor_factory: ExecutorFactory = _default_executor_factory,
+    custom_executor_factory: CustomExecutorFactory | None = None,
     scheduler_factory: SchedulerFactory = _default_scheduler_factory,
 ) -> LLMEngineProtocol:
     """Build the single-process Hugging Face EngineCore path."""
@@ -80,15 +82,26 @@ def default_engine_factory(
         model_config.model_name,
         local_files_only=executor_config.local_files_only,
     )
-    hf_executor_config = NaiveHFExecutorConfig(
-        model_config.model_name,
-        device=executor_config.device,
-        dtype=executor_config.dtype,
-        local_files_only=executor_config.local_files_only,
-        pad_token_id=processor.pad_token_id,
-        eos_token_ids=processor.eos_token_ids,
-    )
-    executor = executor_factory(hf_executor_config)
+    if executor_config.backend == "naive_hf":
+        hf_executor_config = NaiveHFExecutorConfig(
+            model_config.model_name,
+            device=executor_config.device,
+            dtype=executor_config.dtype,
+            local_files_only=executor_config.local_files_only,
+            pad_token_id=processor.pad_token_id,
+            eos_token_ids=processor.eos_token_ids,
+        )
+        executor = executor_factory(hf_executor_config)
+    else:
+        if custom_executor_factory is None:
+            from x_tokens.executor.custom_factory import (
+                create_registered_model_executor,
+            )
+
+            custom_executor_factory = create_registered_model_executor
+        executor = custom_executor_factory(
+            config, processor.pad_token_id, processor.eos_token_ids
+        )
     core_config = EngineCoreConfig(
         (model_config.served_model_name,),
         max_model_len=model_config.max_model_len,

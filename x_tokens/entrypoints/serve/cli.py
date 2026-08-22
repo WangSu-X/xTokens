@@ -10,6 +10,7 @@ import uvicorn
 from x_tokens.config import (
     ExecutorConfig,
     ModelConfig,
+    ParallelConfig,
     SchedulerConfig,
     ServerConfig,
     XTokensConfig,
@@ -26,10 +27,24 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", dest="served_model_name", default="x-tokens-mock")
     parser.add_argument("--engine", choices=("inproc",), default="inproc")
     parser.add_argument("--hf-model")
+    parser.add_argument(
+        "--executor-backend", choices=("naive_hf", "custom"), default="naive_hf"
+    )
     parser.add_argument("--hf-device", default="auto")
     parser.add_argument("--hf-dtype", default="auto")
     parser.add_argument("--hf-local-files-only", action="store_true")
     parser.add_argument("--hf-max-num-seqs", type=int, default=4)
+    parser.add_argument(
+        "--distributed-executor-backend", choices=("uni", "mp"), default="uni"
+    )
+    parser.add_argument("--parallel-device", action="append")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--pipeline-parallel-size", type=int, default=1)
+    parser.add_argument("--context-parallel-size", type=int, default=1)
+    parser.add_argument("--data-parallel-size", type=int, default=1)
+    parser.add_argument("--enable-expert-parallel", action="store_true")
+    parser.add_argument("--expert-parallel-size", type=int)
+    parser.add_argument("--collective-backend", default="nccl")
     parser.add_argument("--api-key", default=os.environ.get("XTOKENS_API_KEY"))
     parser.add_argument("--request-timeout", type=float, default=600.0)
     parser.add_argument("--shutdown-timeout", type=float, default=30.0)
@@ -43,6 +58,15 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
+    parallel_world_size = (
+        args.tensor_parallel_size
+        * args.pipeline_parallel_size
+        * args.context_parallel_size
+        * args.data_parallel_size
+    )
+    parallel_devices = args.parallel_device
+    if parallel_devices is None:
+        parallel_devices = [f"cuda:{index}" for index in range(parallel_world_size)]
     config = XTokensConfig(
         model_config=ModelConfig(
             served_model_name=args.served_model_name,
@@ -50,9 +74,21 @@ def main(argv: list[str] | None = None) -> None:
         ),
         scheduler_config=SchedulerConfig(max_num_seqs=args.hf_max_num_seqs),
         executor_config=ExecutorConfig(
+            backend=args.executor_backend,
             device=args.hf_device,
             dtype=args.hf_dtype,
             local_files_only=args.hf_local_files_only,
+        ),
+        parallel_config=ParallelConfig(
+            distributed_executor_backend=args.distributed_executor_backend,
+            devices=tuple(parallel_devices),
+            tensor_parallel_size=args.tensor_parallel_size,
+            pipeline_parallel_size=args.pipeline_parallel_size,
+            context_parallel_size=args.context_parallel_size,
+            data_parallel_size=args.data_parallel_size,
+            enable_expert_parallel=args.enable_expert_parallel,
+            expert_parallel_size=args.expert_parallel_size,
+            collective_backend=args.collective_backend,
         ),
         server_config=ServerConfig(
             host=args.host,

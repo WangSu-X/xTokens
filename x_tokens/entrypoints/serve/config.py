@@ -8,6 +8,7 @@ from typing import Literal
 from x_tokens.config import (
     ExecutorConfig,
     ModelConfig,
+    ParallelConfig,
     SchedulerConfig,
     ServerConfig,
     XTokensConfig,
@@ -78,6 +79,7 @@ class ServeConfig:
 __all__ = [
     "ExecutorConfig",
     "ModelConfig",
+    "ParallelConfig",
     "SchedulerConfig",
     "ServeConfig",
     "ServerConfig",

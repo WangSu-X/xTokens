@@ -138,6 +138,9 @@ class EngineCore:
     def close(self) -> None:
         self._closed = True
         self._scheduler.abort_all()
+        shutdown = getattr(self._executor, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
         logger.info("engine core closed")
 
     def _validate_request(self, request: GenerateRequest) -> None:

@@ -3,6 +3,7 @@
 from .config import (
     ExecutorConfig,
     ModelConfig,
+    ParallelConfig,
     SchedulerConfig,
     ServerConfig,
     XTokensConfig,
@@ -11,6 +12,7 @@ from .config import (
 __all__ = [
     "ExecutorConfig",
     "ModelConfig",
+    "ParallelConfig",
     "SchedulerConfig",
     "ServerConfig",
     "XTokensConfig",
