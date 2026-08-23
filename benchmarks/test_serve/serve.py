@@ -8,6 +8,7 @@ import math
 import random
 import time
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any
 
 import aiohttp
@@ -224,8 +225,13 @@ async def benchmark(
             )
 
         if ready_check:
+            readiness_input = replace(
+                make_input(samples[0]),
+                output_len=1,
+                request_id=None,
+            )
             ready = await wait_for_endpoint(
-                request_func, make_input(samples[0]), session, timeout_s
+                request_func, readiness_input, session, timeout_s
             )
             if not ready.success:
                 raise RuntimeError(f"endpoint readiness check failed: {ready.error}")

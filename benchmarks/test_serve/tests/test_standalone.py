@@ -164,6 +164,40 @@ class StandaloneBenchmarkTest(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_readiness_generates_one_token_without_changing_workload(self) -> None:
+        requested_output_lengths: list[int] = []
+
+        async def fake_request(request, session):  # type: ignore[no-untyped-def]
+            del session
+            requested_output_lengths.append(request.output_len)
+            return RequestFuncOutput(
+                success=True,
+                generated_text="x",
+                output_tokens=request.output_len,
+                prompt_len=request.prompt_len,
+                latency=0.01,
+                ttft=0.01,
+            )
+
+        samples = [SampleRequest("long prompt", 2048, 1024, request_id="case-0")]
+        with patch.dict(
+            serve_module.BACKENDS,
+            {"fake": ("/v1/completions", fake_request)},
+        ):
+            result = asyncio.run(
+                benchmark(
+                    samples,
+                    backend="fake",
+                    base_url="http://127.0.0.1:1",
+                    model="mock-model",
+                    ready_check=True,
+                    timeout_s=1,
+                )
+            )
+
+        self.assertEqual(requested_output_lengths, [1, 1024])
+        self.assertEqual(result["total_output_tokens"], 1024)
+
     def test_chat_sse_benchmark(self) -> None:
         server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
