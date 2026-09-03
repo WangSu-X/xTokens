@@ -4,14 +4,19 @@ import pytest
 import torch
 from torch import nn
 
-from x_tokens.config import ParallelConfig
-from x_tokens.core.scheduler import ScheduledRequest, SchedulerOutput
+from x_tokens.config import KVCacheConfig, ParallelConfig
+from x_tokens.core.scheduler import (
+    ScheduledRequest,
+    SchedulerOutput,
+    SchedulerPhase,
+)
 from x_tokens.engine.types import GenerateRequest, SamplingParams
 from x_tokens.executor import (
     ModelExecutor,
     MultiprocModelExecutor,
     UniProcModelExecutor,
 )
+from x_tokens.kv_cache import KVCacheMetadata, KVCacheSpec
 from x_tokens.modeling import ModelInput, ModelOutput
 from x_tokens.worker.model_runner import GPUModelRunnerFactory
 
@@ -20,6 +25,8 @@ class TinyNextTokenModel(nn.Module):
     def __init__(self, vocab_size: int = 16) -> None:
         super().__init__()
         self.vocab_size = vocab_size
+        self.anchor = nn.Parameter(torch.zeros(()))
+        self.kv_cache = None
 
     def forward(self, inputs: ModelInput) -> ModelOutput:
         assert inputs.input_ids is not None
@@ -31,6 +38,12 @@ class TinyNextTokenModel(nn.Module):
         )
         logits.scatter_(1, next_tokens.unsqueeze(1), 1000.0)
         return ModelOutput(logits)
+
+    def get_kv_cache_spec(self, block_size: int) -> KVCacheSpec:
+        return KVCacheSpec(1, block_size, 1, 1, self.anchor.element_size())
+
+    def set_kv_cache(self, kv_cache: object | None) -> None:
+        self.kv_cache = kv_cache
 
 
 def tiny_model_factory(context: object) -> TinyNextTokenModel:
@@ -48,11 +61,26 @@ def batch(*contexts: tuple[int, ...]) -> SchedulerOutput:
             SamplingParams(max_tokens=2, temperature=0),
         )
         requests.append(ScheduledRequest(request, context))
-    return SchedulerOutput(tuple(requests))
+    metadata = tuple(
+        KVCacheMetadata(
+            request_id=request.request_id,
+            is_prefill=True,
+            context_len=len(context),
+            query_len=len(context),
+            block_table=(index,),
+            slot_mapping=tuple(index * 4 + offset for offset in range(len(context))),
+        )
+        for index, (request, context) in enumerate(zip(requests, contexts, strict=True))
+    )
+    return SchedulerOutput(tuple(requests), SchedulerPhase.PREFILL, metadata)
 
 
 def runner_factory() -> GPUModelRunnerFactory:
     return GPUModelRunnerFactory(tiny_model_factory, pad_token_id=0)
+
+
+def cache_config() -> KVCacheConfig:
+    return KVCacheConfig(block_size=4, num_gpu_blocks=8)
 
 
 def test_uniproc_executor_runs_pending_step_and_samples_on_device() -> None:
@@ -60,6 +88,7 @@ def test_uniproc_executor_runs_pending_step_and_samples_on_device() -> None:
         ParallelConfig(devices=("cpu",), collective_backend="gloo"),
         runner_factory(),
         eos_token_ids=frozenset((15,)),
+        kv_cache_config=cache_config(),
     )
     scheduled = batch((1, 2), (4,))
     try:
@@ -98,11 +127,32 @@ def test_executor_rejects_execute_execute_without_sampling() -> None:
     executor = UniProcModelExecutor(
         ParallelConfig(devices=("cpu",), collective_backend="gloo"),
         runner_factory(),
+        kv_cache_config=cache_config(),
     )
     scheduled = batch((1,))
     try:
         executor.execute_model(scheduled)
         with pytest.raises(RuntimeError, match="sampled first"):
+            executor.execute_model(scheduled)
+    finally:
+        executor.shutdown()
+
+
+def test_custom_executor_rejects_batch_without_kv_metadata() -> None:
+    executor = UniProcModelExecutor(
+        ParallelConfig(devices=("cpu",), collective_backend="gloo"),
+        runner_factory(),
+        kv_cache_config=cache_config(),
+    )
+    request = GenerateRequest(
+        "missing-metadata",
+        "tiny",
+        (1,),
+        SamplingParams(max_tokens=1, temperature=0),
+    )
+    scheduled = SchedulerOutput((ScheduledRequest(request, (1,)),))
+    try:
+        with pytest.raises(ValueError, match="requires KV cache metadata"):
             executor.execute_model(scheduled)
     finally:
         executor.shutdown()
@@ -118,6 +168,7 @@ def test_executor_rejects_reserved_parallel_execution_modes() -> None:
                 collective_backend="gloo",
             ),
             runner_factory(),
+            kv_cache_config=cache_config(),
         )
 
 
@@ -131,6 +182,7 @@ def test_multiproc_executor_runs_tp_spmd_on_cpu_gloo() -> None:
             timeout_s=20,
         ),
         runner_factory(),
+        kv_cache_config=cache_config(),
     )
     scheduled = batch((7,), (2, 8))
     try:

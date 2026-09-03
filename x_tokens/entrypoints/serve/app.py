@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from dataclasses import replace
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -12,7 +13,12 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from x_tokens.config import XTokensConfig
-from x_tokens.core import EngineCoreConfig, NaiveScheduler, Scheduler
+from x_tokens.core import (
+    EngineCoreConfig,
+    KVCacheScheduler,
+    NaiveScheduler,
+    Scheduler,
+)
 from x_tokens.engine.clients.inproc import InprocClient, SchedulerFactory
 from x_tokens.engine.input_processor import TokenizerInputProcessor
 from x_tokens.engine.llm_engine import LLMEngine, LLMEngineProtocol
@@ -42,9 +48,16 @@ def _default_executor_factory(config: NaiveHFExecutorConfig) -> NaiveHFExecutor:
 
 
 def _default_scheduler_factory(config: EngineCoreConfig) -> Scheduler:
-    return NaiveScheduler(
+    if config.kv_cache_config is None:
+        return NaiveScheduler(
+            max_num_seqs=config.max_num_seqs,
+            max_model_len=config.max_model_len,
+        )
+    return KVCacheScheduler(
         max_num_seqs=config.max_num_seqs,
         max_model_len=config.max_model_len,
+        kv_cache_config=config.kv_cache_config,
+        model_fingerprint=config.model_aliases[0],
     )
 
 
@@ -102,10 +115,20 @@ def default_engine_factory(
         executor = custom_executor_factory(
             config, processor.pad_token_id, processor.eos_token_ids
         )
+    kv_cache_config = None
+    if executor_config.backend == "custom":
+        num_gpu_blocks = getattr(executor, "num_gpu_blocks", 0)
+        if num_gpu_blocks < 1:
+            raise RuntimeError("custom executor did not initialize KV cache")
+        kv_cache_config = replace(
+            config.kv_cache_config,
+            num_gpu_blocks=num_gpu_blocks,
+        )
     core_config = EngineCoreConfig(
         (model_config.served_model_name,),
         max_model_len=model_config.max_model_len,
         max_num_seqs=config.scheduler_config.max_num_seqs,
+        kv_cache_config=kv_cache_config,
     )
     return LLMEngine(
         InprocClient(

@@ -9,16 +9,18 @@ from safetensors.torch import save_file
 from transformers import Qwen3MoeConfig as HFQwen3MoeConfig
 from transformers import Qwen3MoeForCausalLM as HFQwen3MoeForCausalLM
 
-from x_tokens.config import ParallelConfig
-from x_tokens.core.scheduler import ScheduledRequest, SchedulerOutput
+from x_tokens.config import KVCacheConfig, ParallelConfig
+from x_tokens.core.scheduler import ScheduledRequest, SchedulerOutput, SchedulerPhase
 from x_tokens.distributed import ParallelTopology, materialize_parallel_context
 from x_tokens.engine.types import GenerateRequest, SamplingParams
 from x_tokens.executor import MultiprocModelExecutor
+from x_tokens.kv_cache import KVCacheMetadata
 from x_tokens.modeling import ModelInput, ModelLoadConfig
 from x_tokens.modeling.loader import resolve_model_source
 from x_tokens.modeling.models import Qwen3MoeForCausalLM, Qwen3MoeRunnerFactory
 from x_tokens.modeling.models.qwen3_moe import resolve_torch_dtype
 from x_tokens.modeling.registry import resolve_model_registration
+from x_tokens.worker.kv_cache import GPUKVCache
 
 
 def tiny_hf_model() -> HFQwen3MoeForCausalLM:
@@ -111,6 +113,15 @@ def load_custom_model(directory: Path) -> Qwen3MoeForCausalLM:
     )
     model.load_model()
     model.eval()
+    spec = model.get_kv_cache_spec(block_size=4)
+    model.set_kv_cache(
+        GPUKVCache(
+            spec,
+            num_blocks=8,
+            device=torch.device("cpu"),
+            dtype=model.embed_tokens.weight.dtype,
+        )
+    )
     return model
 
 
@@ -141,13 +152,54 @@ def test_qwen3_moe_checkpoint_schema_and_logits_match_hf(
             use_cache=False,
             logits_to_keep=1,
         ).logits[:, -1, :]
+        metadata = (
+            KVCacheMetadata("first", True, 1, 1, (0,), (0,)),
+            KVCacheMetadata("second", True, 3, 3, (1,), (4, 5, 6)),
+        )
         actual = custom_model(
-            ModelInput(input_ids, attention_mask, position_ids)
+            ModelInput(input_ids, attention_mask, position_ids, metadata)
         ).logits
 
     assert custom_model.load_report is not None
     assert custom_model.load_report.missing_parameters == ()
     assert custom_model.load_report.unexpected_tensors == ()
+    assert torch.allclose(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+def test_qwen3_moe_prefill_then_decode_matches_full_context_hf(
+    tmp_path: Path,
+) -> None:
+    hf_model = tiny_hf_model()
+    save_tiny_checkpoint(tmp_path, hf_model, legacy_experts=False)
+    custom_model = load_custom_model(tmp_path)
+    prompt = torch.tensor([[1, 2, 3]])
+    mask = torch.ones_like(prompt)
+
+    with torch.inference_mode():
+        prefill = custom_model(
+            ModelInput(
+                prompt,
+                mask,
+                torch.tensor([[0, 1, 2]]),
+                (KVCacheMetadata("decode", True, 3, 3, (0,), (0, 1, 2)),),
+            )
+        ).logits
+        next_token = prefill.argmax(dim=-1)
+        expected = hf_model(
+            input_ids=torch.cat((prompt, next_token[:, None]), dim=1),
+            attention_mask=torch.ones((1, 4), dtype=torch.long),
+            use_cache=False,
+            logits_to_keep=1,
+        ).logits[:, -1, :]
+        actual = custom_model(
+            ModelInput(
+                next_token[:, None],
+                torch.ones((1, 1), dtype=torch.long),
+                torch.tensor([[3]]),
+                (KVCacheMetadata("decode", False, 4, 1, (0,), (3,)),),
+            )
+        ).logits
+
     assert torch.allclose(actual, expected, atol=2e-5, rtol=2e-5)
 
 
@@ -169,6 +221,7 @@ def test_qwen3_moe_tp2_executor_loads_rank_shards_and_samples(
     executor = MultiprocModelExecutor(
         parallel_config,
         Qwen3MoeRunnerFactory(source, resolved.config, load_config, pad_token_id=0),
+        kv_cache_config=KVCacheConfig(block_size=4, num_gpu_blocks=8),
     )
     request = GenerateRequest(
         "tiny-qwen",
@@ -176,7 +229,12 @@ def test_qwen3_moe_tp2_executor_loads_rank_shards_and_samples(
         (1, 2, 3),
         SamplingParams(max_tokens=1, temperature=0),
     )
-    batch = SchedulerOutput((ScheduledRequest(request, (1, 2, 3)),))
+    metadata = KVCacheMetadata("tiny-qwen", True, 3, 3, (0,), (0, 1, 2))
+    batch = SchedulerOutput(
+        (ScheduledRequest(request, (1, 2, 3)),),
+        SchedulerPhase.PREFILL,
+        (metadata,),
+    )
     with torch.inference_mode():
         expected = int(
             hf_model(

@@ -49,4 +49,5 @@ def create_registered_model_executor(
         config.parallel_config,
         runner_factory,
         eos_token_ids=eos_token_ids,
+        kv_cache_config=config.kv_cache_config,
     )

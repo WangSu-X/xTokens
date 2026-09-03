@@ -7,6 +7,7 @@ from typing import Literal
 
 from x_tokens.config import (
     ExecutorConfig,
+    KVCacheConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -78,6 +79,7 @@ class ServeConfig:
 
 __all__ = [
     "ExecutorConfig",
+    "KVCacheConfig",
     "ModelConfig",
     "ParallelConfig",
     "SchedulerConfig",

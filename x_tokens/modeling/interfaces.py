@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from x_tokens.distributed import ParallelGroupKind
+from x_tokens.kv_cache import KVCacheMetadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,6 +15,7 @@ class ModelInput:
     input_ids: Any | None
     attention_mask: Any
     position_ids: Any
+    kv_cache_metadata: tuple[KVCacheMetadata, ...]
 
 
 @dataclass(frozen=True, slots=True)

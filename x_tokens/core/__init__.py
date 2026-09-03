@@ -2,12 +2,15 @@
 
 from .config import EngineCoreConfig
 from .engine_core import EngineCore, EngineCoreOutputs
+from .kv_cache_manager import KVCacheCapacityError, KVCacheManager
 from .scheduler import (
+    KVCacheScheduler,
     NaiveScheduler,
     RequestStatus,
     ScheduledRequest,
     Scheduler,
     SchedulerOutput,
+    SchedulerPhase,
     SchedulerUpdate,
 )
 
@@ -15,10 +18,14 @@ __all__ = [
     "EngineCore",
     "EngineCoreConfig",
     "EngineCoreOutputs",
+    "KVCacheCapacityError",
+    "KVCacheManager",
+    "KVCacheScheduler",
     "NaiveScheduler",
     "RequestStatus",
     "ScheduledRequest",
     "Scheduler",
     "SchedulerOutput",
+    "SchedulerPhase",
     "SchedulerUpdate",
 ]

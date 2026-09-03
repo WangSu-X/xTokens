@@ -9,6 +9,7 @@ import uvicorn
 
 from x_tokens.config import (
     ExecutorConfig,
+    KVCacheConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -34,6 +35,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--hf-dtype", default="auto")
     parser.add_argument("--hf-local-files-only", action="store_true")
     parser.add_argument("--hf-max-num-seqs", type=int, default=4)
+    parser.add_argument("--kv-cache-block-size", type=int, default=16)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--num-gpu-blocks", type=int)
+    parser.add_argument("--disable-prefix-caching", action="store_true")
     parser.add_argument(
         "--distributed-executor-backend", choices=("uni", "mp"), default="uni"
     )
@@ -78,6 +83,12 @@ def main(argv: list[str] | None = None) -> None:
             device=args.hf_device,
             dtype=args.hf_dtype,
             local_files_only=args.hf_local_files_only,
+        ),
+        kv_cache_config=KVCacheConfig(
+            block_size=args.kv_cache_block_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            num_gpu_blocks=args.num_gpu_blocks,
+            enable_prefix_caching=not args.disable_prefix_caching,
         ),
         parallel_config=ParallelConfig(
             distributed_executor_backend=args.distributed_executor_backend,

@@ -17,7 +17,7 @@ from ..engine.types import (
 from ..executor.base import Executor
 from ..logger import init_logger
 from .config import EngineCoreConfig
-from .scheduler import NaiveScheduler, ScheduledRequest, Scheduler
+from .scheduler import KVCacheScheduler, NaiveScheduler, ScheduledRequest, Scheduler
 
 logger = init_logger(__name__)
 
@@ -50,13 +50,20 @@ class EngineCore:
     ) -> None:
         self._config = config
         self._executor = executor
-        self._scheduler = (
-            scheduler
-            if scheduler is not None
-            else NaiveScheduler(
-                max_num_seqs=config.max_num_seqs, max_model_len=config.max_model_len
+        if scheduler is not None:
+            self._scheduler = scheduler
+        elif config.kv_cache_config is not None:
+            self._scheduler = KVCacheScheduler(
+                max_num_seqs=config.max_num_seqs,
+                max_model_len=config.max_model_len,
+                kv_cache_config=config.kv_cache_config,
+                model_fingerprint=config.model_aliases[0],
             )
-        )
+        else:
+            self._scheduler = NaiveScheduler(
+                max_num_seqs=config.max_num_seqs,
+                max_model_len=config.max_model_len,
+            )
         self._pending_outputs = EngineCoreOutputs()
         self._closed = False
 

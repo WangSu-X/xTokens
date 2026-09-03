@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from x_tokens.config import KVCacheConfig
+
 
 @dataclass(frozen=True, slots=True)
 class EngineCoreConfig:
@@ -12,6 +14,7 @@ class EngineCoreConfig:
     model_aliases: tuple[str, ...]
     max_model_len: int = 4096
     max_num_seqs: int = 4
+    kv_cache_config: KVCacheConfig | None = None
 
     def __post_init__(self) -> None:
         if not self.model_aliases:

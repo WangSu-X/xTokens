@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from x_tokens.config import ParallelConfig
+from x_tokens.config import KVCacheConfig, ParallelConfig
 from x_tokens.distributed import ParallelTopology, materialize_parallel_context
 
 from .model_runner import (
@@ -86,6 +86,12 @@ class GPUWorker:
 
     def execute_model(self, inputs: ModelRunnerInput) -> ModelRunnerOutput | None:
         return self._runner().execute_model(inputs)
+
+    def get_kv_cache_capacity(self, config: KVCacheConfig) -> int:
+        return self._runner().get_kv_cache_capacity(config)
+
+    def initialize_kv_cache(self, num_blocks: int, block_size: int) -> None:
+        self._runner().initialize_kv_cache(num_blocks, block_size)
 
     def sample_tokens(self, step_id: int) -> tuple[int, ...] | None:
         return self._runner().sample_tokens(step_id)

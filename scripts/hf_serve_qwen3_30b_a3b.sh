@@ -111,7 +111,7 @@ env CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" \
     --hf-model "$MODEL_PATH" \
     --hf-local-files-only \
     --hf-dtype bfloat16 \
-    --hf-max-num-seqs "${XTOKENS_MAX_NUM_SEQS:-4}" \
+    --hf-max-num-seqs "${XTOKENS_MAX_NUM_SEQS:-15}" \
     --host "$HOST" \
     --port "$PORT" \
     "$@" &

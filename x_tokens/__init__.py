@@ -2,6 +2,7 @@
 
 from .config import (
     ExecutorConfig,
+    KVCacheConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -11,6 +12,7 @@ from .config import (
 
 __all__ = [
     "ExecutorConfig",
+    "KVCacheConfig",
     "ModelConfig",
     "ParallelConfig",
     "SchedulerConfig",

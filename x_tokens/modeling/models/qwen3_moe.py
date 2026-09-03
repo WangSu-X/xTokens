@@ -1,4 +1,4 @@
-"""Inference-only, no-KV-cache Qwen3-MoE with tensor parallelism."""
+"""Inference-only Qwen3-MoE with tensor parallelism and paged KV storage."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from x_tokens.distributed import ParallelContext, ParallelGroupKind
+from x_tokens.kv_cache import KVCacheMetadata, KVCacheSpec
 from x_tokens.modeling.config import ModelLoadConfig, Qwen3MoeModelConfig
 from x_tokens.modeling.interfaces import ModelInput, ModelOutput
 from x_tokens.modeling.layers import (
@@ -25,6 +26,7 @@ from x_tokens.modeling.loader.safetensors_loader import (
     WeightLoadReport,
 )
 from x_tokens.modeling.loader.source import ResolvedModelSource
+from x_tokens.worker.kv_cache import GPUKVCache
 from x_tokens.worker.model_runner import GPUModelRunner
 
 
@@ -80,6 +82,7 @@ class Qwen3MoeAttention(nn.Module):
     def __init__(
         self,
         config: Qwen3MoeModelConfig,
+        layer_index: int,
         context: ParallelContext,
         dtype: torch.dtype,
     ) -> None:
@@ -90,6 +93,8 @@ class Qwen3MoeAttention(nn.Module):
         self.num_kv_heads = max(1, config.num_key_value_heads // group.world_size)
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.scaling = self.head_dim**-0.5
+        self.layer_index = layer_index
+        self.kv_cache: GPUKVCache | None = None
         kwargs = {
             "group": group,
             "device": context.device,
@@ -126,9 +131,9 @@ class Qwen3MoeAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        kv_cache_metadata: tuple[KVCacheMetadata, ...],
     ) -> torch.Tensor:
         batch_size, sequence_length, _ = hidden_states.shape
         qkv = self.qkv_proj(hidden_states)
@@ -149,21 +154,38 @@ class Qwen3MoeAttention(nn.Module):
         query = query * rope_cos + _rotate_half(query) * rope_sin
         key = key * rope_cos + _rotate_half(key) * rope_sin
         query = query.transpose(1, 2)
+        if self.kv_cache is None:
+            raise RuntimeError("Qwen3-MoE requires an initialized KV cache")
+        if len(kv_cache_metadata) != batch_size:
+            raise ValueError("Qwen3-MoE requires KV metadata per request")
+        self.kv_cache.write(self.layer_index, kv_cache_metadata, key, value)
+        key, value = self.kv_cache.gather(self.layer_index, kv_cache_metadata)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
+        key_length = key.shape[2]
+        allowed = torch.zeros(
+            batch_size,
+            1,
+            sequence_length,
+            key_length,
+            dtype=torch.bool,
+            device=hidden_states.device,
+        )
+        key_positions = torch.arange(key_length, device=hidden_states.device)
+        for batch_index, metadata in enumerate(kv_cache_metadata):
+            query_start = sequence_length - metadata.query_len
+            query_positions = torch.arange(
+                metadata.context_len - metadata.query_len,
+                metadata.context_len,
+                device=hidden_states.device,
+            )
+            allowed[batch_index, 0, query_start:, : metadata.context_len] = (
+                key_positions[: metadata.context_len].unsqueeze(0)
+                <= query_positions.unsqueeze(1)
+            )
         if self.num_key_value_groups != 1:
             key = key.repeat_interleave(self.num_key_value_groups, dim=1)
             value = value.repeat_interleave(self.num_key_value_groups, dim=1)
-        causal = torch.ones(
-            sequence_length,
-            sequence_length,
-            dtype=torch.bool,
-            device=hidden_states.device,
-        ).tril()
-        allowed = (
-            causal.view(1, 1, sequence_length, sequence_length)
-            & attention_mask[:, None, None, :].bool()
-        )
         attended = F.scaled_dot_product_attention(
             query,
             key,
@@ -310,7 +332,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         dtype: torch.dtype,
     ) -> None:
         super().__init__()
-        self.self_attn = Qwen3MoeAttention(config, context, dtype)
+        self.self_attn = Qwen3MoeAttention(config, layer_index, context, dtype)
         self.mlp: DenseSwiGLU | Qwen3MoeSparseMoeBlock
         if config.is_sparse_layer(layer_index):
             self.mlp = Qwen3MoeSparseMoeBlock(config, context, dtype)
@@ -332,12 +354,15 @@ class Qwen3MoeDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        kv_cache_metadata: tuple[KVCacheMetadata, ...],
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.self_attn(
-            self.input_layernorm(hidden_states), attention_mask, cos, sin
+            self.input_layernorm(hidden_states),
+            cos,
+            sin,
+            kv_cache_metadata,
         )
         return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
 
@@ -387,6 +412,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
         self.load_report: WeightLoadReport | None = None
+        self.kv_cache: GPUKVCache | None = None
 
     def load_model(self) -> None:
         loader = SafeTensorsWeightLoader(
@@ -398,13 +424,34 @@ class Qwen3MoeForCausalLM(nn.Module):
     def forward(self, inputs: ModelInput) -> ModelOutput:
         if inputs.input_ids is None:
             raise ValueError("Qwen3-MoE TP baseline requires input_ids")
+        if not inputs.kv_cache_metadata:
+            raise ValueError("Qwen3-MoE requires KV cache metadata")
         hidden_states = self.embed_tokens(inputs.input_ids)
         cos, sin = self.rotary_emb(inputs.position_ids, hidden_states.dtype)
         for layer in self.layers:
-            hidden_states = layer(hidden_states, inputs.attention_mask, cos, sin)
+            hidden_states = layer(
+                hidden_states,
+                cos,
+                sin,
+                inputs.kv_cache_metadata,
+            )
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states[:, -1, :])
         return ModelOutput(logits)
+
+    def get_kv_cache_spec(self, block_size: int) -> KVCacheSpec:
+        return KVCacheSpec(
+            num_layers=self.config.num_hidden_layers,
+            block_size=block_size,
+            num_kv_heads=self.layers[0].self_attn.num_kv_heads,
+            head_dim=self.config.head_dim,
+            dtype_bytes=self.embed_tokens.weight.element_size(),
+        )
+
+    def set_kv_cache(self, kv_cache: GPUKVCache | None) -> None:
+        self.kv_cache = kv_cache
+        for layer in self.layers:
+            layer.self_attn.kv_cache = kv_cache
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,36 +2,52 @@
 
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+
 HOST=${XTOKENS_HOST:-127.0.0.1}
 PORT=${XTOKENS_PORT:-8991}
 MODEL=${XTOKENS_SERVED_MODEL_NAME:-qwen3-30b-a3b}
-PROMPT=${XTOKENS_TEST_PROMPT:-"Explain continuous batching in one sentence."}
+# Tokenizer used to generate prompts with an exact token count; keep it in
+# sync with the served model so --input-len/--output-len are measured in the
+# same units the server uses (a fallback word-splitter would over-count).
+TOKENIZER=${TOKENIZER:-${XTOKENS_HF_MODEL:-/model}}
 BASE_URL="http://${HOST}:${PORT}"
-PYTHON_BIN=${PYTHON_BIN:-python3}
+PYTHON_BIN=${PYTHON_BIN:-$PROJECT_ROOT/.venv/bin/python}
+BACKEND=${BACKEND:-openai}
+DATASET_NAME=${DATASET_NAME:-random}
+REQUEST_RATE=${REQUEST_RATE:-20}
+MAX_CONCURRENCY=${MAX_CONCURRENCY:-20}
+NUM_PROMPTS=${NUM_PROMPTS:-20}
+INPUT_LEN=${INPUT_LEN:-2048}
+OUTPUT_LEN=${OUTPUT_LEN:-1024}
+# Per-request HTTP timeout. It must exceed the longest request:
+# prefill + output_len x ~0.9 s/token. Default 1200s (20 min) covers
+# OUTPUT_LEN=1024; override with READY_TIMEOUT when changing OUTPUT_LEN.
+READY_TIMEOUT=${READY_TIMEOUT:-1200}
+RESULT_FILE=${RESULT_FILE:-$PROJECT_ROOT/workspace/exp/test_serve_qwen3_30b_a3b.json}
 
-if ! command -v curl >/dev/null 2>&1; then
-  echo "curl is required" >&2
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "Python interpreter not found: $PYTHON_BIN" >&2
+  echo "Install dependencies with: uv sync" >&2
   exit 1
 fi
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  echo "Python is required to encode the JSON request body" >&2
-  exit 1
-fi
 
-echo "Checking ${BASE_URL}/ready ..."
-curl --fail --silent --show-error "${BASE_URL}/ready"
-printf '\n\n'
-
-echo "Sending non-streaming completion request ..."
-curl --fail --silent --show-error \
-  -H 'Content-Type: application/json' \
-  -d "$(printf '%s' "$PROMPT" | "$PYTHON_BIN" -c 'import json, sys; print(json.dumps({"model": sys.argv[1], "prompt": sys.stdin.read()}))' "$MODEL")" \
-  "${BASE_URL}/v1/completions"
-printf '\n\n'
-
-echo "Sending streaming chat request ..."
-curl --fail --silent --show-error --no-buffer \
-  -H 'Content-Type: application/json' \
-  -d "$(printf '%s' "$PROMPT" | "$PYTHON_BIN" -c 'import json, sys; print(json.dumps({"model": sys.argv[1], "messages": [{"role": "user", "content": sys.stdin.read()}], "stream": True}))' "$MODEL")" \
-  "${BASE_URL}/v1/chat/completions"
-printf '\n'
+mkdir -p "$(dirname -- "$RESULT_FILE")"
+echo "Running test_serve benchmark against ${BASE_URL} ..."
+cd "$PROJECT_ROOT"
+PYTHONPATH="$PROJECT_ROOT/benchmarks${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON_BIN" -m test_serve \
+  --backend "$BACKEND" \
+  --endpoint "$BASE_URL" \
+  --model "$MODEL" \
+  --tokenizer "$TOKENIZER" \
+  --dataset-name "$DATASET_NAME" \
+  --num-prompts "$NUM_PROMPTS" \
+  --input-len "$INPUT_LEN" \
+  --output-len "$OUTPUT_LEN" \
+  --request-rate "$REQUEST_RATE" \
+  --max-concurrency "$MAX_CONCURRENCY" \
+  --ready-timeout "$READY_TIMEOUT" \
+  --save-result "$RESULT_FILE" \
+  "$@"

@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from x_tokens.config import KVCacheConfig
 from x_tokens.distributed import ParallelContext
+from x_tokens.kv_cache import KVCacheMetadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +22,7 @@ class ModelRunnerInput:
     step_id: int
     token_ids: tuple[tuple[int, ...], ...]
     sampling_metadata: tuple[SamplingMetadata, ...]
+    kv_cache_metadata: tuple[KVCacheMetadata, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +32,10 @@ class ModelRunnerOutput:
 
 class ModelRunner(Protocol):
     def load_model(self) -> None: ...
+
+    def get_kv_cache_capacity(self, config: KVCacheConfig) -> int: ...
+
+    def initialize_kv_cache(self, num_blocks: int, block_size: int) -> None: ...
 
     def execute_model(self, inputs: ModelRunnerInput) -> ModelRunnerOutput | None: ...
 

@@ -50,6 +50,22 @@ class ExecutorConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class KVCacheConfig:
+    block_size: int = 16
+    gpu_memory_utilization: float = 0.9
+    num_gpu_blocks: int | None = None
+    enable_prefix_caching: bool = True
+
+    def __post_init__(self) -> None:
+        if self.block_size < 1:
+            raise ValueError("KV cache block_size must be positive")
+        if not 0 < self.gpu_memory_utilization <= 1:
+            raise ValueError("gpu_memory_utilization must be in (0, 1]")
+        if self.num_gpu_blocks is not None and self.num_gpu_blocks < 1:
+            raise ValueError("num_gpu_blocks must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class ParallelConfig:
     """Immutable process and model-parallel settings.
 
@@ -147,6 +163,7 @@ class XTokensConfig:
     model_config: ModelConfig = field(default_factory=ModelConfig)
     scheduler_config: SchedulerConfig = field(default_factory=SchedulerConfig)
     executor_config: ExecutorConfig = field(default_factory=ExecutorConfig)
+    kv_cache_config: KVCacheConfig = field(default_factory=KVCacheConfig)
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
     server_config: ServerConfig = field(default_factory=ServerConfig)
 

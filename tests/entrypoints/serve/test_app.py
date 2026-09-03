@@ -61,6 +61,7 @@ class FakeEngine:
 
 class FakeExecutor(Executor):
     eos_token_ids = frozenset((9,))
+    num_gpu_blocks = 256
 
     def execute_model(self, batch: SchedulerOutput) -> ModelForwardOutput:
         return ModelForwardOutput(None)
