@@ -146,6 +146,7 @@ def load_samples(
     tokenizer: Any,
     *,
     dataset_path: str | None = None,
+    sample_pool_size: int | None = None,
     dataset_config: str | None = None,
     dataset_split: str = "train",
     seed: int = 0,
@@ -160,13 +161,27 @@ def load_samples(
     ``sharegpt``, ``custom``, and ``trace``. Any other dataset name is treated
     as a Hugging Face Hub dataset ID and loaded with ``datasets.load_dataset``.
     ``dataset_config`` and ``dataset_split`` select its configuration and split.
+    ``sample_pool_size`` is supported by ``random`` and ``random-mm``; requests
+    sample from the generated pool with replacement.
     """
     name = dataset.lower().replace("-", "_")
+    if sample_pool_size is not None and name not in {"random", "random_mm"}:
+        raise DatasetError(
+            "--sample-pool-size is only supported by random and random-mm datasets"
+        )
     if name in {"random", "random_mm"}:
-        samples = []
-        for index in range(num_prompts):
+        if sample_pool_size is None:
+            pool_size = num_prompts
+        else:
+            if sample_pool_size <= 0:
+                raise DatasetError("sample-pool-size must be positive")
+            if sample_pool_size > num_prompts:
+                raise DatasetError("sample-pool-size must be <= num-prompts")
+            pool_size = sample_pool_size
+        pool = []
+        for index in range(pool_size):
             prompt = make_prompt(tokenizer, input_len, seed + index)
-            samples.append(
+            pool.append(
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=input_len,
@@ -179,6 +194,21 @@ def load_samples(
                     ),
                 )
             )
+        # Sample with replacement: pool_size controls the number of distinct
+        # prompts, while num_prompts controls the number of requests sent.
+        rng = random.Random(seed)
+        samples = [
+            SampleRequest(
+                prompt=(sample := rng.choice(pool)).prompt,
+                prompt_len=sample.prompt_len,
+                expected_output_len=sample.expected_output_len,
+                request_id=str(index),
+                multi_modal_data=sample.multi_modal_data,
+                chat_messages=sample.chat_messages,
+                request_overrides=sample.request_overrides,
+            )
+            for index in range(num_prompts)
+        ]
         return samples
     if name in {"prefix_repetition", "prefix_repetition_random"}:
         if num_prefixes <= 0 or num_prompts < num_prefixes:

@@ -293,6 +293,7 @@ python -m test_serve \
 | `--model` | 模型 ID；省略时自动发现 |
 | `--dataset-name` / `--dataset` | 数据集类型，默认 `random` |
 | `--dataset-path` | `sharegpt`、`custom`、`trace` 的本地 `json`、`jsonl` 或 `csv` 路径 |
+| `--sample-pool-size` | `random`/`random-mm` 的 prompt pool 大小；每条请求从 pool 有放回随机抽样 |
 | `--dataset-config` | Hugging Face Hub 数据集配置名 |
 | `--dataset-split` | Hugging Face Hub 数据集 split，默认 `train` |
 | `--request-rate` | 目标 RPS，默认 `inf` |
@@ -310,6 +311,20 @@ python -m test_serve \
 | `--log-level` | CLI 日志级别，默认 `INFO`；使用 `DEBUG` 查看单请求发送日志 |
 
 ### 数据集示例
+
+随机复用 prompt pool（适合测试 APC）：
+
+```bash
+python -m test_serve \
+  --dataset-name random \
+  --sample-pool-size 32 \
+  --num-prompts 128 \
+  --input-len 8192 \
+  --output-len 2048 \
+  --max-concurrency 16
+```
+
+`--sample-pool-size 32 --num-prompts 128` 会先生成 32 个不同 prompt，随后 128 次请求分别从 pool 中独立随机选择一个（有放回）。每个 prompt 平均被选择 4 次，但实际次数由 `--seed` 决定，不保证严格均匀。每次请求仍使用唯一 request ID。
 
 最大压力：
 

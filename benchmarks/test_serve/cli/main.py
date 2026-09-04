@@ -54,6 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-name", "--dataset", default="random")
     parser.add_argument("--dataset-path")
     parser.add_argument(
+        "--sample-pool-size",
+        type=int,
+        help=(
+            "number of samples generated for random/random-mm pool; "
+            "requests sample from it with replacement"
+        ),
+    )
+    parser.add_argument(
         "--dataset-config",
         help="Hugging Face dataset configuration; ignored by built-in and local datasets",
     )
@@ -155,6 +163,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.output_len,
         tokenizer,
         dataset_path=args.dataset_path,
+        sample_pool_size=args.sample_pool_size,
         dataset_config=args.dataset_config,
         dataset_split=args.dataset_split,
         seed=args.seed,

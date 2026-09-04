@@ -99,6 +99,34 @@ class StandaloneBenchmarkTest(unittest.TestCase):
         self.assertEqual(result["completed"], 1)
         self.assertEqual(result["total_output_tokens"], 2)
 
+    def test_random_dataset_samples_from_pool_with_replacement(self) -> None:
+        samples = load_samples(
+            "random",
+            128,
+            3,
+            2,
+            BasicTokenizer(),
+            sample_pool_size=4,
+            seed=7,
+        )
+        self.assertEqual(len(samples), 128)
+        self.assertEqual(len({sample.prompt for sample in samples}), 4)
+        self.assertEqual(
+            {sample.request_id for sample in samples},
+            {str(index) for index in range(128)},
+        )
+
+    def test_random_dataset_rejects_invalid_pool_size(self) -> None:
+        with self.assertRaises(ValueError):
+            load_samples(
+                "random",
+                4,
+                3,
+                2,
+                BasicTokenizer(),
+                sample_pool_size=5,
+            )
+
     def test_huggingface_dataset_is_normalized(self) -> None:
         fake_datasets = types.ModuleType("datasets")
         load_dataset = Mock(return_value=[{"text": "one two"}, {"prompt": "three"}])
