@@ -200,9 +200,12 @@ step t 处理长度 = prompt_length + t
 因此随着生成进行，单步延迟持续上升。线性层反复处理整个 prefix，attention 也反复计算历史
 token 间的关系。实践中系统往往先达到 TPOT 或吞吐量上限，而不是先达到 HBM 上限。
 
-### 4.6 当前 xTokens 实现
+### 4.6 历史 xTokens 无 cache 实现
 
-当前 `NaiveHFExecutor` 正是无 KV cache 路径：
+> 本节描述已删除的历史执行后端，不适用于当前 API server。当前 `Scheduler` 必须管理 KV cache，
+> 模型通过项目 `ModelExecutor` 执行；无 cache profiling 脚本仅用作独立测量工具。
+
+历史 `NaiveHFExecutor` 采用无 KV cache 路径：
 
 - `NaiveScheduler` 最多调度 `max_num_seqs` 个 running requests；
 - 每一步把每个请求的 `prompt_token_ids + output_token_ids` 组成完整上下文；
@@ -492,7 +495,6 @@ OOM 的最大值。
 | 有连续 KV cache | 所有请求当前/预留 token 总数 | KV bytes/token × token 总数，再加 activation | cache 扩容复制、碎片、HBM bandwidth |
 | 有 paged KV cache | 已分配 block 总数 | 可用 block 数 / 每请求 block 数 | block 内部碎片、prefill 峰值、SLO |
 
-对当前 xTokens 的直接结论是：在 `NaiveHFExecutor` 仍然设置 `use_cache=False` 时，不能使用
-KV cache 容量公式配置 `max_num_seqs`。应先优化或确认 last-token logits 和 attention backend，
-再针对目标上下文长度实测无 cache forward 的峰值显存；未来引入 KV cache executor 后，才应以
-KV block/token budget 为主要 admission 条件，并同时保留 prefill activation 空间。
+当前 xTokens 统一使用带 KV cache 的 `Scheduler` 和项目 `ModelExecutor`，应以可用 KV block
+和请求 token 数作为 admission 的主要容量约束，并为 prefill activation 与 KV gather 临时张量
+预留显存。历史无 cache forward 的测量结果不能直接用作当前 API server 的并发上限。

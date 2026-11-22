@@ -8,6 +8,7 @@ from typing import Any
 
 from x_tokens.config import KVCacheConfig, ParallelConfig
 from x_tokens.distributed import ParallelTopology, materialize_parallel_context
+from x_tokens.worker.base import ModelWorker
 
 from .model_runner import (
     ModelRunner,
@@ -26,7 +27,7 @@ class GPUWorkerConfig:
     output_rank: int
 
 
-class GPUWorker:
+class GPUWorker(ModelWorker):
     def __init__(
         self,
         config: GPUWorkerConfig,

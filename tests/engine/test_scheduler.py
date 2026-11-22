@@ -3,9 +3,12 @@ from __future__ import annotations
 import logging
 from unittest.mock import Mock
 
+import pytest
+
+from x_tokens.config import KVCacheConfig
 from x_tokens.core import scheduler as scheduler_module
-from x_tokens.core.scheduler import NaiveScheduler, RequestStatus
-from x_tokens.engine.types import FinishReason, GenerateRequest, SamplingParams
+from x_tokens.core.scheduler import RequestStatus, Scheduler
+from x_tokens.engine.protocol import FinishReason, GenerateRequest, SamplingParams
 
 
 def request(
@@ -23,7 +26,12 @@ def request(
 
 
 def test_scheduler_admits_requests_in_fifo_batches() -> None:
-    scheduler = NaiveScheduler(max_num_seqs=2, max_model_len=8)
+    scheduler = Scheduler(
+        kv_cache_config=KVCacheConfig(block_size=2, num_gpu_blocks=8),
+        model_fingerprint="tiny",
+        max_num_seqs=2,
+        max_model_len=8,
+    )
     for request_id in ("one", "two", "three"):
         scheduler.add_request(request(request_id), (1,))
 
@@ -51,7 +59,12 @@ def test_scheduler_logs_every_scheduled_batch(monkeypatch) -> None:
         lambda level: level == logging.DEBUG,
     )
     monkeypatch.setattr(scheduler_module.logger, "debug", debug)
-    scheduler = NaiveScheduler(max_num_seqs=1, max_model_len=8)
+    scheduler = Scheduler(
+        kv_cache_config=KVCacheConfig(block_size=2, num_gpu_blocks=8),
+        model_fingerprint="tiny",
+        max_num_seqs=1,
+        max_model_len=8,
+    )
     scheduler.add_request(request("one"), (1,))
 
     scheduler.schedule()
@@ -63,11 +76,16 @@ def test_scheduler_logs_every_scheduled_batch(monkeypatch) -> None:
         if call.args[0].startswith("scheduler step:")
     ]
     assert len(schedule_calls) == 2
-    assert all(call.args[1] == 1 for call in schedule_calls)
+    assert all(call.args[2] == 1 for call in schedule_calls)
 
 
 def test_scheduler_finishes_on_eos_and_length() -> None:
-    scheduler = NaiveScheduler(max_num_seqs=2, max_model_len=3)
+    scheduler = Scheduler(
+        kv_cache_config=KVCacheConfig(block_size=2, num_gpu_blocks=8),
+        model_fingerprint="tiny",
+        max_num_seqs=2,
+        max_model_len=3,
+    )
     scheduler.add_request(request("eos", max_tokens=3), (1,))
     scheduler.add_request(request("length", max_tokens=1), (1,))
     batch = scheduler.schedule()
@@ -80,7 +98,12 @@ def test_scheduler_finishes_on_eos_and_length() -> None:
 
 
 def test_scheduler_applies_ignore_eos_per_request_until_max_tokens() -> None:
-    scheduler = NaiveScheduler(max_num_seqs=2, max_model_len=8)
+    scheduler = Scheduler(
+        kv_cache_config=KVCacheConfig(block_size=2, num_gpu_blocks=8),
+        model_fingerprint="tiny",
+        max_num_seqs=2,
+        max_model_len=8,
+    )
     scheduler.add_request(request("stop", max_tokens=2), (1,))
     scheduler.add_request(
         request("ignore", max_tokens=2, ignore_eos=True),
@@ -106,7 +129,12 @@ def test_scheduler_applies_ignore_eos_per_request_until_max_tokens() -> None:
 
 
 def test_scheduler_aborts_waiting_and_running_requests() -> None:
-    scheduler = NaiveScheduler(max_num_seqs=1, max_model_len=8)
+    scheduler = Scheduler(
+        kv_cache_config=KVCacheConfig(block_size=2, num_gpu_blocks=8),
+        model_fingerprint="tiny",
+        max_num_seqs=1,
+        max_model_len=8,
+    )
     scheduler.add_request(request("running"), (1,))
     scheduler.add_request(request("waiting"), (1,))
     running = scheduler.schedule().requests[0]
@@ -116,3 +144,73 @@ def test_scheduler_aborts_waiting_and_running_requests() -> None:
     assert running.status is RequestStatus.ABORTED
     assert not scheduler.has_work
     assert not scheduler.abort("unknown")
+
+
+def test_scheduler_requires_resolved_kv_capacity() -> None:
+    with pytest.raises(ValueError, match="requires resolved num_gpu_blocks"):
+        Scheduler(
+            max_num_seqs=1,
+            max_model_len=8,
+            kv_cache_config=KVCacheConfig(),
+            model_fingerprint="tiny",
+        )
+
+
+def test_scheduler_abort_all_releases_cache_and_request_ids() -> None:
+    scheduler = Scheduler(
+        max_num_seqs=1,
+        max_model_len=8,
+        kv_cache_config=KVCacheConfig(block_size=2, num_gpu_blocks=8),
+        model_fingerprint="tiny",
+    )
+    scheduler.add_request(request("running"), (1,))
+    scheduler.add_request(request("waiting"), (2,))
+    scheduler.schedule()
+
+    aborted = scheduler.abort_all()
+
+    assert {item.request_id for item in aborted} == {"running", "waiting"}
+    assert all(item.status is RequestStatus.ABORTED for item in aborted)
+    assert scheduler.kv_cache_manager.stats().active_blocks == 0
+    assert not scheduler.has_work
+    assert not scheduler.schedule().requests
+    scheduler.add_request(request("running"), (1,))
+    assert scheduler.schedule().requests[0].request_id == "running"
+
+
+def test_scheduler_rejects_invalid_output_before_committing_cache() -> None:
+    scheduler = Scheduler(
+        max_num_seqs=1,
+        max_model_len=8,
+        kv_cache_config=KVCacheConfig(block_size=2, num_gpu_blocks=8),
+        model_fingerprint="tiny",
+    )
+    scheduler.add_request(request("one"), (1,))
+    batch = scheduler.schedule()
+
+    with pytest.raises(ValueError, match="batch size and token output size differ"):
+        scheduler.update_from_output(batch, (), eos_token_ids=frozenset())
+
+    assert scheduler.kv_cache_manager.num_computed_tokens("one") == 0
+    assert batch.requests[0].needs_prefill
+    assert batch.requests[0].output_token_ids == []
+    scheduler.update_from_output(batch, (2,), eos_token_ids=frozenset())
+    assert scheduler.kv_cache_manager.num_computed_tokens("one") == 1
+
+
+def test_scheduler_releases_cache_at_context_limit() -> None:
+    scheduler = Scheduler(
+        max_num_seqs=1,
+        max_model_len=4,
+        kv_cache_config=KVCacheConfig(block_size=2, num_gpu_blocks=2),
+        model_fingerprint="tiny",
+    )
+    scheduler.add_request(request("one", max_tokens=10), (1, 2, 3))
+
+    updates = scheduler.update_from_output(
+        scheduler.schedule(), (4,), eos_token_ids=frozenset()
+    )
+
+    assert updates[0].finish_reason is FinishReason.LENGTH
+    assert scheduler.kv_cache_manager.stats().active_blocks == 0
+    assert not scheduler.has_work

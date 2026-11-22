@@ -25,16 +25,13 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the xTokens Serve API")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model", dest="served_model_name", default="x-tokens-mock")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--served-model-name")
     parser.add_argument("--engine", choices=("inproc",), default="inproc")
-    parser.add_argument("--hf-model")
-    parser.add_argument(
-        "--executor-backend", choices=("naive_hf", "custom"), default="naive_hf"
-    )
-    parser.add_argument("--hf-device", default="auto")
-    parser.add_argument("--hf-dtype", default="auto")
-    parser.add_argument("--hf-local-files-only", action="store_true")
-    parser.add_argument("--hf-max-num-seqs", type=int, default=4)
+    parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--max-num-seqs", type=int, default=4)
+    parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--kv-cache-block-size", type=int, default=16)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--num-gpu-blocks", type=int)
@@ -74,15 +71,14 @@ def main(argv: list[str] | None = None) -> None:
         parallel_devices = [f"cuda:{index}" for index in range(parallel_world_size)]
     config = XTokensConfig(
         model_config=ModelConfig(
-            served_model_name=args.served_model_name,
-            model=args.hf_model,
+            served_model_name=args.served_model_name or args.model,
+            model=args.model,
+            max_model_len=args.max_model_len,
         ),
-        scheduler_config=SchedulerConfig(max_num_seqs=args.hf_max_num_seqs),
+        scheduler_config=SchedulerConfig(max_num_seqs=args.max_num_seqs),
         executor_config=ExecutorConfig(
-            backend=args.executor_backend,
-            device=args.hf_device,
-            dtype=args.hf_dtype,
-            local_files_only=args.hf_local_files_only,
+            dtype=args.dtype,
+            local_files_only=args.local_files_only,
         ),
         kv_cache_config=KVCacheConfig(
             block_size=args.kv_cache_block_size,

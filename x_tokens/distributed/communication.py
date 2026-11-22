@@ -22,7 +22,7 @@ class CollectiveGroup(Protocol):
     def barrier(self) -> None: ...
 
 
-class SingletonCollectiveGroup:
+class SingletonCollectiveGroup(CollectiveGroup):
     """No-op implementation preserving the group API for size-one meshes."""
 
     rank_in_group = 0
@@ -52,7 +52,7 @@ class SingletonCollectiveGroup:
         return
 
 
-class TorchDistributedCollectiveGroup:
+class TorchDistributedCollectiveGroup(CollectiveGroup):
     """A process-local adapter around a torch distributed process group."""
 
     def __init__(

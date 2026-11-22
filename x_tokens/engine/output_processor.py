@@ -3,18 +3,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Protocol
+from typing import Any
+
+from .protocol import OutputProcessor
 
 
-class OutputProcessor(Protocol):
-    """Maintain request-local detokenization state outside EngineCore."""
-
-    def process_token(self, request_id: str, token_id: int) -> str: ...
-
-    def finish(self, request_id: str) -> None: ...
-
-
-class TokenizerOutputProcessor:
+class TokenizerOutputProcessor(OutputProcessor):
     """Incrementally detokenize generated IDs with a HF-compatible tokenizer."""
 
     def __init__(self, tokenizer: Any) -> None:

@@ -3,18 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any, Protocol
+from typing import Any
 
-from .types import GenerateRequest
-
-
-class InputProcessor(Protocol):
-    """Turn user-facing prompts into the token IDs accepted by EngineCore."""
-
-    def process(self, request: GenerateRequest) -> GenerateRequest: ...
+from .protocol import GenerateRequest, InputProcessor
 
 
-class TokenizerInputProcessor:
+class TokenizerInputProcessor(InputProcessor):
     """Adapt a Hugging Face-compatible tokenizer for the Engine boundary."""
 
     def __init__(self, tokenizer: Any) -> None:
@@ -28,7 +22,7 @@ class TokenizerInputProcessor:
             from transformers import AutoTokenizer
         except ImportError as error:
             raise RuntimeError(
-                "HF input processing requires x-tokens[hf] (transformers)"
+                "Tokenizer input processing requires transformers"
             ) from error
         return cls(
             AutoTokenizer.from_pretrained(model, local_files_only=local_files_only)

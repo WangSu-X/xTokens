@@ -4,27 +4,25 @@ import asyncio
 from collections.abc import AsyncIterator
 from unittest.mock import Mock
 
+import pytest
 from fastapi.testclient import TestClient
 
-from x_tokens.config import ExecutorConfig, ModelConfig, ParallelConfig, XTokensConfig
+from x_tokens.config import ModelConfig, ParallelConfig, ServerConfig, XTokensConfig
 from x_tokens.core.scheduler import SchedulerOutput
 from x_tokens.engine.input_processor import InputProcessor
+from x_tokens.engine.llm_engine import LLMEngine
 from x_tokens.engine.output_processor import OutputProcessor
-from x_tokens.engine.types import (
+from x_tokens.engine.protocol import (
     EngineEvent,
     EngineHealth,
     ErrorEvent,
     FinishedEvent,
     FinishReason,
     GenerateRequest,
-    SamplingParams,
     TokenEvent,
 )
-from x_tokens.entrypoints.serve import ServeConfig, create_app
 from x_tokens.entrypoints.serve import app as serve_app
-from x_tokens.entrypoints.serve import generation as generation_module
-from x_tokens.entrypoints.serve.generation import GenerationService
-from x_tokens.entrypoints.serve.models import ModelRegistry
+from x_tokens.entrypoints.serve import create_app
 from x_tokens.executor.base import Executor, ModelForwardOutput
 
 
@@ -64,7 +62,7 @@ class FakeExecutor(Executor):
     num_gpu_blocks = 256
 
     def execute_model(self, batch: SchedulerOutput) -> ModelForwardOutput:
-        return ModelForwardOutput(None)
+        return ModelForwardOutput()
 
     def sample_tokens(
         self, output: ModelForwardOutput, batch: SchedulerOutput
@@ -96,16 +94,22 @@ class FakeOutputProcessor(OutputProcessor):
         del request_id
 
 
-def client_for(engine: FakeEngine, **config: object) -> TestClient:
+def client_for(
+    engine: FakeEngine, monkeypatch: pytest.MonkeyPatch, **config: object
+) -> TestClient:
+    monkeypatch.setattr(serve_app, "LLMEngine", lambda _: engine)
     app = create_app(
-        ServeConfig(served_model_name="test-model", **config), lambda _: engine
+        XTokensConfig(
+            model_config=ModelConfig(served_model_name="test-model"),
+            server_config=ServerConfig(**config),
+        )
     )
     return TestClient(app)
 
 
-def test_completion_uses_client_request_id_and_openai_error_format() -> None:
+def test_completion_uses_client_request_id_and_openai_error_format(monkeypatch) -> None:
     engine = FakeEngine()
-    with client_for(engine) as client:
+    with client_for(engine, monkeypatch) as client:
         response = client.post(
             "/v1/completions",
             headers={"X-Request-ID": "benchmark-1"},
@@ -123,6 +127,7 @@ def test_completion_uses_client_request_id_and_openai_error_format() -> None:
             "completion_tokens": 2,
             "total_tokens": 5,
         }
+        assert engine.calls[0].prompt == "hello"
         assert engine.calls[0].sampling.ignore_eos is True
 
         invalid = client.post(
@@ -133,12 +138,16 @@ def test_completion_uses_client_request_id_and_openai_error_format() -> None:
         assert invalid.json()["error"]["type"] == "invalid_request_error"
 
 
-def test_ready_gate_and_api_key() -> None:
+def test_ready_gate_and_api_key(monkeypatch) -> None:
     engine = FakeEngine(ready=False)
-    with client_for(engine, api_key="secret") as client:
+    with client_for(engine, monkeypatch, api_key="secret") as client:
         assert client.get("/ready").status_code == 503
         unauthorized = client.get("/v1/models")
         assert unauthorized.status_code == 401
+        wrong_key = client.get(
+            "/v1/models", headers={"Authorization": "Bearer wrong-key"}
+        )
+        assert wrong_key.status_code == 401
         response = client.post(
             "/v1/completions",
             headers={"Authorization": "Bearer secret"},
@@ -149,11 +158,12 @@ def test_ready_gate_and_api_key() -> None:
     assert engine.closed
 
 
-def test_chat_stream_includes_usage_and_late_error() -> None:
+def test_chat_stream_includes_usage_and_late_error(monkeypatch) -> None:
     engine = FakeEngine(error_after_token=True)
-    with client_for(engine) as client:
+    with client_for(engine, monkeypatch) as client:
         response = client.post(
             "/v1/chat/completions",
+            headers={"X-Request-ID": "chat-stream-1"},
             json={
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "hello"}],
@@ -163,62 +173,32 @@ def test_chat_stream_includes_usage_and_late_error() -> None:
             },
         )
         assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert response.headers["x-request-id"] == "chat-stream-1"
+        assert '"id":"chat-stream-1"' in response.text
         assert '"content":"Hello"' in response.text
         assert '"message":"mock failure"' in response.text
         assert response.text.endswith("data: [DONE]\n\n")
+        assert engine.calls[0].request_id == "chat-stream-1"
         assert engine.calls[0].sampling.ignore_eos is True
-
-
-def test_unfinished_event_stream_aborts_request(monkeypatch) -> None:
-    engine = FakeEngine()
-    info = Mock()
-    monkeypatch.setattr(generation_module.logger, "info", info)
-    service = GenerationService(engine, ModelRegistry("test-model"))
-    request = GenerateRequest("cancel-me", "test-model", "hello", SamplingParams(2))
-
-    async def close_early() -> None:
-        stream = service.events(request)
-        await anext(stream)
-        await stream.aclose()
-
-    asyncio.run(close_early())
-    assert engine.aborted == ["cancel-me"]
-    assert any(
-        call.args[0].startswith("request cancelled:") for call in info.call_args_list
-    )
-
-
-def test_finished_event_stream_logs_request_lifecycle(monkeypatch) -> None:
-    engine = FakeEngine()
-    info = Mock()
-    monkeypatch.setattr(generation_module.logger, "info", info)
-    service = GenerationService(engine, ModelRegistry("test-model"))
-    request = GenerateRequest("logged", "test-model", "hello", SamplingParams(2))
-
-    async def consume() -> None:
-        async for _ in service.events(request):
-            pass
-
-    asyncio.run(consume())
-
-    messages = [call.args[0] for call in info.call_args_list]
-    assert any(message.startswith("request started:") for message in messages)
-    assert any(message.startswith("request finished:") for message in messages)
 
 
 def test_default_factory_uses_inproc_llm_engine(monkeypatch) -> None:
     monkeypatch.setattr(
-        serve_app.TokenizerInputProcessor,
-        "from_config",
+        "x_tokens.engine.llm_engine.TokenizerInputProcessor.from_config",
         lambda *args, **kwargs: FakeInputProcessor(),
     )
-    monkeypatch.setattr(serve_app, "NaiveHFExecutor", lambda _: FakeExecutor())
     monkeypatch.setattr(
-        serve_app,
-        "TokenizerOutputProcessor",
+        "x_tokens.executor.custom_factory.create_registered_model_executor",
+        lambda *args: FakeExecutor(),
+    )
+    monkeypatch.setattr(
+        "x_tokens.engine.llm_engine.TokenizerOutputProcessor",
         lambda _: FakeOutputProcessor(),
     )
-    app = create_app(ServeConfig(served_model_name="test-model"))
+    app = create_app(
+        XTokensConfig(model_config=ModelConfig(served_model_name="test-model"))
+    )
 
     with TestClient(app) as client:
         response = client.post(
@@ -232,17 +212,20 @@ def test_default_factory_uses_inproc_llm_engine(monkeypatch) -> None:
 
 def test_default_factory_ignores_eos_until_max_tokens(monkeypatch) -> None:
     monkeypatch.setattr(
-        serve_app.TokenizerInputProcessor,
-        "from_config",
+        "x_tokens.engine.llm_engine.TokenizerInputProcessor.from_config",
         lambda *args, **kwargs: FakeInputProcessor(),
     )
-    monkeypatch.setattr(serve_app, "NaiveHFExecutor", lambda _: FakeExecutor())
     monkeypatch.setattr(
-        serve_app,
-        "TokenizerOutputProcessor",
+        "x_tokens.executor.custom_factory.create_registered_model_executor",
+        lambda *args: FakeExecutor(),
+    )
+    monkeypatch.setattr(
+        "x_tokens.engine.llm_engine.TokenizerOutputProcessor",
         lambda _: FakeOutputProcessor(),
     )
-    app = create_app(ServeConfig(served_model_name="test-model"))
+    app = create_app(
+        XTokensConfig(model_config=ModelConfig(served_model_name="test-model"))
+    )
 
     with TestClient(app) as client:
         response = client.post(
@@ -262,8 +245,7 @@ def test_default_factory_ignores_eos_until_max_tokens(monkeypatch) -> None:
 
 def test_custom_factory_uses_registered_model_runner(monkeypatch) -> None:
     monkeypatch.setattr(
-        serve_app.TokenizerInputProcessor,
-        "from_config",
+        "x_tokens.engine.llm_engine.TokenizerInputProcessor.from_config",
         lambda *args, **kwargs: FakeInputProcessor(),
     )
     registered_factory = Mock(return_value=FakeExecutor())
@@ -273,11 +255,28 @@ def test_custom_factory_uses_registered_model_runner(monkeypatch) -> None:
     )
     config = XTokensConfig(
         model_config=ModelConfig(served_model_name="test-model"),
-        executor_config=ExecutorConfig(backend="custom"),
         parallel_config=ParallelConfig(devices=("cpu",), collective_backend="gloo"),
     )
 
-    engine = serve_app.default_engine_factory(config)
+    engine = LLMEngine(config, executor_factory=registered_factory)
 
     registered_factory.assert_called_once_with(config, 0, frozenset({9}))
     asyncio.run(engine.close())
+
+
+@pytest.mark.parametrize("num_gpu_blocks", [0, 1])
+def test_default_factory_cleans_up_invalid_kv_capacity(
+    monkeypatch, num_gpu_blocks
+) -> None:
+    monkeypatch.setattr(
+        "x_tokens.engine.llm_engine.TokenizerInputProcessor.from_config",
+        lambda *args, **kwargs: FakeInputProcessor(),
+    )
+    executor = FakeExecutor()
+    executor.num_gpu_blocks = num_gpu_blocks
+    executor.shutdown = Mock()
+
+    with pytest.raises((RuntimeError, ValueError), match="KV cache"):
+        LLMEngine(XTokensConfig(), executor_factory=lambda *args: executor)
+
+    executor.shutdown.assert_called_once_with()

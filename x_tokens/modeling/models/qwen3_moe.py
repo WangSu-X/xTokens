@@ -11,7 +11,7 @@ from torch import nn
 from x_tokens.distributed import ParallelContext, ParallelGroupKind
 from x_tokens.kv_cache import KVCacheMetadata, KVCacheSpec
 from x_tokens.modeling.config import ModelLoadConfig, Qwen3MoeModelConfig
-from x_tokens.modeling.interfaces import ModelInput, ModelOutput
+from x_tokens.modeling.interfaces import ModelInput, ModelOutput, XTokensModel
 from x_tokens.modeling.layers import (
     MergedColumnParallelLinear,
     ParallelLMHead,
@@ -26,8 +26,9 @@ from x_tokens.modeling.loader.safetensors_loader import (
     WeightLoadReport,
 )
 from x_tokens.modeling.loader.source import ResolvedModelSource
+from x_tokens.modeling.registry import RunnerFactoryBuilder
 from x_tokens.worker.kv_cache import GPUKVCache
-from x_tokens.worker.model_runner import GPUModelRunner
+from x_tokens.worker.model_runner import GPUModelRunner, ModelRunnerFactory
 
 
 def resolve_torch_dtype(
@@ -367,7 +368,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
 
 
-class Qwen3MoeForCausalLM(nn.Module):
+class Qwen3MoeForCausalLM(nn.Module, XTokensModel):
     def __init__(
         self,
         config: Qwen3MoeModelConfig,
@@ -455,7 +456,7 @@ class Qwen3MoeForCausalLM(nn.Module):
 
 
 @dataclass(frozen=True, slots=True)
-class Qwen3MoeRunnerFactory:
+class Qwen3MoeRunnerFactory(RunnerFactoryBuilder, ModelRunnerFactory):
     source: ResolvedModelSource
     model_config: Qwen3MoeModelConfig
     load_config: ModelLoadConfig

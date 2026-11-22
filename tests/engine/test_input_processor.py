@@ -4,7 +4,7 @@ import pytest
 
 from x_tokens.engine.input_processor import TokenizerInputProcessor
 from x_tokens.engine.output_processor import TokenizerOutputProcessor
-from x_tokens.engine.types import GenerateRequest, SamplingParams
+from x_tokens.engine.protocol import GenerateRequest, SamplingParams
 
 
 class FakeTokenizer:

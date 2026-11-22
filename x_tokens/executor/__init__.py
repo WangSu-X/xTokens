@@ -9,7 +9,6 @@ from .model_executor import (
     create_model_executor,
 )
 from .multiproc_model_executor import MultiprocModelExecutor
-from .naive_hf_executor import NaiveHFExecutor, NaiveHFExecutorConfig
 from .uniproc_model_executor import UniProcModelExecutor
 
 __all__ = [
@@ -17,8 +16,6 @@ __all__ = [
     "ModelExecutor",
     "ModelForwardOutput",
     "MultiprocModelExecutor",
-    "NaiveHFExecutor",
-    "NaiveHFExecutorConfig",
     "RunnerGroup",
     "RunnerStepId",
     "UniProcModelExecutor",

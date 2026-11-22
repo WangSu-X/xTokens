@@ -18,7 +18,7 @@ class WorkerHandle(Protocol):
     def check_health(self) -> None: ...
 
 
-class LocalWorkerHandle:
+class LocalWorkerHandle(WorkerHandle):
     def __init__(self, rank: int, worker: ModelWorker) -> None:
         self.rank = rank
         self.worker = worker
@@ -46,7 +46,7 @@ class LocalWorkerHandle:
         self.worker.check_health()
 
 
-class ProcessWorkerHandle:
+class ProcessWorkerHandle(WorkerHandle):
     def __init__(self, rank: int, process: Any, connection: Connection) -> None:
         self.rank = rank
         self.process = process

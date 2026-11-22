@@ -8,7 +8,7 @@ from typing import Literal
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
-    served_model_name: str = "x-tokens-mock"
+    served_model_name: str = "x-tokens"
     model: str | None = None
     max_model_len: int = 4096
 
@@ -27,26 +27,17 @@ class ModelConfig:
 
 @dataclass(frozen=True, slots=True)
 class SchedulerConfig:
-    policy: str = "naive"
     max_num_seqs: int = 4
 
     def __post_init__(self) -> None:
-        if not self.policy:
-            raise ValueError("scheduler policy must not be empty")
         if self.max_num_seqs < 1:
             raise ValueError("max_num_seqs must be positive")
 
 
 @dataclass(frozen=True, slots=True)
 class ExecutorConfig:
-    backend: str = "naive_hf"
-    device: str = "auto"
     dtype: str = "auto"
     local_files_only: bool = False
-
-    def __post_init__(self) -> None:
-        if not self.backend:
-            raise ValueError("executor backend must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +137,7 @@ class ServerConfig:
     max_request_body_size: int = 4 * 1024 * 1024
     cors_origins: tuple[str, ...] = ()
     access_log: bool = True
+    core_client_mode: Literal["in_proc", "multi_proc"] = "in_proc"
 
     def __post_init__(self) -> None:
         if self.port < 1 or self.port > 65535:
@@ -166,13 +158,3 @@ class XTokensConfig:
     kv_cache_config: KVCacheConfig = field(default_factory=KVCacheConfig)
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
     server_config: ServerConfig = field(default_factory=ServerConfig)
-
-    def __post_init__(self) -> None:
-        if self.executor_config.backend not in {"naive_hf", "custom"}:
-            raise ValueError(
-                f"unsupported executor backend: {self.executor_config.backend}"
-            )
-        if self.scheduler_config.policy != "naive":
-            raise ValueError(
-                f"unsupported scheduler policy: {self.scheduler_config.policy}"
-            )

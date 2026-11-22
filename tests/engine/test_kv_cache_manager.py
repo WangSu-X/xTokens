@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from x_tokens.config import KVCacheConfig
 from x_tokens.core.kv_cache_manager import KVCacheManager
-from x_tokens.core.scheduler import KVCacheScheduler, SchedulerPhase
-from x_tokens.engine.types import GenerateRequest, SamplingParams
+from x_tokens.core.scheduler import Scheduler, SchedulerPhase
+from x_tokens.engine.protocol import GenerateRequest, SamplingParams
 
 
 def cache_config(*, blocks: int = 8, block_size: int = 2) -> KVCacheConfig:
@@ -123,7 +123,7 @@ def test_lru_evicts_only_unreferenced_cached_blocks() -> None:
 
 def test_kv_continuous_batching_interleaves_prefill_and_decode() -> None:
     config = cache_config(blocks=16)
-    scheduler = KVCacheScheduler(
+    scheduler = Scheduler(
         max_num_seqs=2,
         max_model_len=8,
         kv_cache_config=config,
@@ -158,7 +158,7 @@ def test_kv_continuous_batching_interleaves_prefill_and_decode() -> None:
 
 
 def test_kv_scheduler_releases_blocks_on_abort_and_failure() -> None:
-    scheduler = KVCacheScheduler(
+    scheduler = Scheduler(
         max_num_seqs=2,
         max_model_len=8,
         kv_cache_config=cache_config(blocks=16),
@@ -176,7 +176,7 @@ def test_kv_scheduler_releases_blocks_on_abort_and_failure() -> None:
 
 
 def test_kv_scheduler_ignore_eos_finishes_at_generation_limit() -> None:
-    scheduler = KVCacheScheduler(
+    scheduler = Scheduler(
         max_num_seqs=1,
         max_model_len=8,
         kv_cache_config=cache_config(blocks=8),
@@ -198,7 +198,7 @@ def test_kv_scheduler_ignore_eos_finishes_at_generation_limit() -> None:
 
 
 def test_kv_scheduler_preempts_when_decode_needs_another_block() -> None:
-    scheduler = KVCacheScheduler(
+    scheduler = Scheduler(
         max_num_seqs=2,
         max_model_len=4,
         kv_cache_config=cache_config(blocks=3),

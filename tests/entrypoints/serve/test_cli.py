@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from x_tokens.entrypoints.serve import cli
 
 
@@ -35,8 +37,17 @@ def test_cli_builds_explicit_parallel_config(monkeypatch) -> None:
 
     cli.main(
         [
-            "--executor-backend",
-            "custom",
+            "--model",
+            "/models/qwen3",
+            "--served-model-name",
+            "test-model",
+            "--dtype",
+            "bfloat16",
+            "--local-files-only",
+            "--max-num-seqs",
+            "8",
+            "--max-model-len",
+            "8192",
             "--distributed-executor-backend",
             "mp",
             "--tensor-parallel-size",
@@ -49,7 +60,42 @@ def test_cli_builds_explicit_parallel_config(monkeypatch) -> None:
     )
 
     config = invocation["config"]
-    assert config.executor_config.backend == "custom"
+    assert config.model_config.model == "/models/qwen3"
+    assert config.model_config.served_model_name == "test-model"
+    assert config.model_config.max_model_len == 8192
+    assert config.executor_config.dtype == "bfloat16"
+    assert config.executor_config.local_files_only
+    assert config.scheduler_config.max_num_seqs == 8
     assert config.parallel_config.distributed_executor_backend == "mp"
     assert config.parallel_config.tensor_parallel_size == 2
     assert config.parallel_config.devices == ("cuda:0", "cuda:1")
+
+
+def test_cli_defaults_served_model_name_to_model(monkeypatch) -> None:
+    invocation: dict[str, Any] = {}
+    monkeypatch.setattr(
+        cli, "create_app", lambda config: invocation.update(config=config)
+    )
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
+
+    cli.main(["--model", "org/model"])
+
+    assert invocation["config"].model_config.served_model_name == "org/model"
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--hf-model",
+        "--hf-device",
+        "--hf-dtype",
+        "--hf-local-files-only",
+        "--hf-max-num-seqs",
+        "--executor-backend",
+    ],
+)
+def test_cli_rejects_removed_executor_options(option: str) -> None:
+    with pytest.raises(SystemExit) as error:
+        cli.main(["--model", "test-model", option])
+
+    assert error.value.code == 2

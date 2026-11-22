@@ -5,14 +5,24 @@ from pathlib import Path
 
 import pytest
 import torch
+from fastapi.testclient import TestClient
 from safetensors.torch import save_file
+from tokenizers import Tokenizer, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 from transformers import Qwen3MoeConfig as HFQwen3MoeConfig
 from transformers import Qwen3MoeForCausalLM as HFQwen3MoeForCausalLM
 
-from x_tokens.config import KVCacheConfig, ParallelConfig
+from x_tokens.config import (
+    ExecutorConfig,
+    KVCacheConfig,
+    ModelConfig,
+    ParallelConfig,
+    XTokensConfig,
+)
 from x_tokens.core.scheduler import ScheduledRequest, SchedulerOutput, SchedulerPhase
 from x_tokens.distributed import ParallelTopology, materialize_parallel_context
-from x_tokens.engine.types import GenerateRequest, SamplingParams
+from x_tokens.engine.protocol import GenerateRequest, SamplingParams
+from x_tokens.entrypoints.serve import create_app
 from x_tokens.executor import MultiprocModelExecutor
 from x_tokens.kv_cache import KVCacheMetadata
 from x_tokens.modeling import ModelInput, ModelLoadConfig
@@ -251,3 +261,85 @@ def test_qwen3_moe_tp2_executor_loads_rank_shards_and_samples(
         assert executor.sample_tokens(output, batch) == (expected,)
     finally:
         executor.shutdown()
+
+
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_default_server_runs_registered_model_with_kv_cache(
+    tmp_path: Path, prefix_caching: bool
+) -> None:
+    hf_model = tiny_hf_model()
+    save_tiny_checkpoint(tmp_path, hf_model, legacy_experts=False)
+    backend = Tokenizer(
+        models.WordLevel(
+            {f"token-{index}": index for index in range(16)}, unk_token="token-0"
+        )
+    )
+    backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="token-0",
+        pad_token="token-0",
+        eos_token="token-15",
+    )
+    tokenizer.save_pretrained(tmp_path)
+    context = torch.tensor([[1, 2, 3]])
+    expected_tokens: list[int] = []
+    with torch.inference_mode():
+        for _ in range(3):
+            token = (
+                hf_model(
+                    input_ids=context,
+                    attention_mask=torch.ones_like(context),
+                    use_cache=False,
+                    logits_to_keep=1,
+                )
+                .logits[:, -1, :]
+                .argmax(dim=-1)
+            )
+            expected_tokens.append(int(token.item()))
+            context = torch.cat((context, token[:, None]), dim=1)
+    expected_text = tokenizer.decode(expected_tokens, skip_special_tokens=True)
+    app = create_app(
+        XTokensConfig(
+            model_config=ModelConfig(
+                model=str(tmp_path), served_model_name="tiny", max_model_len=16
+            ),
+            executor_config=ExecutorConfig(dtype="float32", local_files_only=True),
+            parallel_config=ParallelConfig(devices=("cpu",), collective_backend="gloo"),
+            kv_cache_config=KVCacheConfig(
+                block_size=2, num_gpu_blocks=8, enable_prefix_caching=prefix_caching
+            ),
+        )
+    )
+    payload = {
+        "model": "tiny",
+        "prompt": "token-1 token-2 token-3",
+        "temperature": 0,
+        "max_tokens": 3,
+        "ignore_eos": True,
+    }
+    with TestClient(app) as client:
+        response = client.post("/v1/completions", json=payload)
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["text"] == expected_text
+        assert response.json()["usage"] == {
+            "prompt_tokens": 3,
+            "completion_tokens": 3,
+            "total_tokens": 6,
+        }
+        streamed = client.post("/v1/completions", json={**payload, "stream": True})
+        assert streamed.status_code == 200
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in streamed.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert (
+            "".join(chunk["choices"][0].get("text", "") for chunk in chunks)
+            == expected_text
+        )
+        assert chunks[-1]["choices"][0]["finish_reason"] == "length"
+        engine = app.state.engine
+        stats = engine.core_client.engine_core._scheduler.kv_cache_manager.stats()
+        assert stats.active_blocks == 0
+        assert bool(stats.prefix_hits) is prefix_caching

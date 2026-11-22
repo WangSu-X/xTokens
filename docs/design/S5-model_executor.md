@@ -1,0 +1,391 @@
+# 设计文档：ModelExecutor（模型执行器）
+
+## 架构位置
+
+本设计属于 xTokens 三层分布式架构的 **P1/P2 边界** 区域（见 arch.md）：
+
+- **P1 - EngineCore**：Scheduler 决定本步 batch 和 KV cache 分配
+- **P1/P2 边界**：ModelExecutor 是执行层的统一入口，屏蔽单卡 vs 多卡差异
+- **P2 - ModelRunner Workers**：GPUWorker 和 ModelRunner 实现 SPMD 模型执行
+
+涉及的主要类：`ModelExecutor`（抽象）、`UniProcModelExecutor`、`MultiprocModelExecutor`、`RunnerGroup`、`WorkerHandle`
+
+## 摘要
+
+`ModelExecutor` 是 EngineCore 与模型执行层的统一接口。它根据 `ParallelConfig` 的 `distributed_executor_backend` (uni/mp) 选择具体实现，管理 runner group 集合，并通过 collective RPC 或直接调用将 batch forward 和采样请求分发到各 worker。EngineCore 无需关心单卡 vs 多卡，只需调用 `execute_model()` 和 `sample_tokens()` 两个同步接口。当前仅支持张量并行 (TP=1/2/...)；管道并行、专家并行等维度需要未来扩展。
+
+## 背景
+
+EngineCore 需要一个执行后端来完成模型前向和采样。直接调用 Hugging Face 无法支持分布式并行、自定义 layer、或灵活的 KV cache 管理。因此需要设计一个通用的执行层接口，支持：
+
+1. **单卡执行**（UniProc）：直接调用模型，无进程间通信
+2. **多卡 TP 执行**（MultiProc）：通过 NCCL ring 协调，RPC 分发
+
+此外，执行层需要与 Scheduler 协作：
+- Scheduler 决定本步的请求 batch 和 KV cache 地址
+- ModelExecutor 将调度输出转译为模型输入（token IDs、采样参数、块地址等）
+- 执行后返回 logits，由 EngineCore 采样得到 token IDs
+
+执行层还需管理模型初始化、权重加载、分布式上下文建立和生命周期。
+
+## 目标
+
+- 提供 `execute_model()` 和 `sample_tokens()` 两个稳定的同步接口
+- 支持 uni (单卡) 和 mp (多卡 TP) 两种执行 backend
+- 自动推导并初始化 KV cache 容量（blocks 数）
+- 支持模型热加载和正常关闭
+- 将 TP/PP/EP/CP group 的建立和参数 shard 逻辑隐藏在 worker 内
+- 与 Scheduler 的 KV cache metadata 无缝集成
+
+## 非目标
+
+- 不实现管道并行 (PP)、专家并行 (EP) 或数据并行 (DP)；仅 TP
+- 不管理模型权重的磁盘加载和缓存；由 runner_factory 和 GPUWorker 负责
+- 不实现异步执行；所有操作都是同步阻塞
+- 不处理模型架构检测；需要用户显式指定模型类型
+
+## 整体设计
+
+```
+EngineCore
+    ↓ SchedulerOutput (requests, phase, kv_cache_metadata)
+    ↓
+ModelExecutor (control plane)
+    ├─ execute_model(batch)
+    │   ├─ 1. Translate: SchedulerOutput → ModelRunnerInput
+    │   ├─ 2. collective_rpc("execute_model", input) to all workers
+    │   ├─ 3. Gather responses, validate output rank
+    │   └─ return ModelForwardOutput(runner_step_id)
+    │
+    └─ sample_tokens(forward_output, batch)
+        ├─ 1. collective_rpc("sample_tokens", step_id) to all workers
+        ├─ 2. Gather token batch from output rank
+        └─ return token_ids
+    
+Per-worker (P2):
+    ├─ GPUWorker.execute_model(input)
+    │   ├─ Load KV blocks from block addresses
+    │   ├─ Model forward (可能包含 allreduce)
+    │   └─ return logits (仅 output rank) 或 None (其他 rank)
+    │
+    └─ GPUWorker.sample_tokens(step_id)
+        ├─ 采样逻辑（温度、top-p、top-k）
+        └─ return token_ids (仅 output rank) 或 None (其他 rank)
+```
+
+## 详细设计
+
+### 接口
+
+```python
+class ModelExecutor(Executor, ABC):
+    """Engine-facing control plane for model execution."""
+    
+    @staticmethod
+    def get_class(parallel_config: ParallelConfig) -> type[ModelExecutor]:
+        """根据 backend 选择 UniProc 或 MultiProc 实现"""
+        
+    def execute_model(self, batch: SchedulerOutput) -> ModelForwardOutput:
+        """执行本步 forward，返回 logits 和步骤标识"""
+        
+    def sample_tokens(
+        self, output: ModelForwardOutput, batch: SchedulerOutput
+    ) -> tuple[int, ...]:
+        """对 forward output 采样，返回本 batch 的 token IDs"""
+        
+    def check_health(self) -> None:
+        """检查所有 worker 的健康状态"""
+        
+    def shutdown(self) -> None:
+        """关闭所有 worker，释放资源"""
+```
+
+### 核心流程
+
+#### 1. 初始化
+
+```python
+executor = ModelExecutor.get_class(parallel_config)(
+    parallel_config=parallel_config,
+    runner_factory=runner_factory,  # 回调，用于创建 ModelRunner
+    eos_token_ids=frozenset([...]),
+    kv_cache_config=kv_cache_config,
+)
+```
+
+初始化步骤：
+1. 校验 `parallel_config`：仅支持 TP（PP/EP/DP 的 size 必须为 1）
+2. 调用 `_init_executor()`：
+   - **UniProcModelExecutor**：直接创建 1 个 GPUWorker，初始化并加载模型
+   - **MultiprocModelExecutor**：创建 N 个子进程，每个持有 1 个 GPUWorker
+3. 调用 `_initialize_kv_cache()`：
+   - 向所有 worker 查询 KV cache 容量
+   - 取最小值作为全局 `num_gpu_blocks`
+   - 通知 worker 初始化对应大小的块池
+
+#### 2. Execute Forward
+
+```python
+runner_input = ModelRunnerInput(
+    step_id=step_counter,
+    token_ids=(
+        # 对每个请求，取最后 query_len 个 token
+        request.context_token_ids[-metadata.query_len:]
+        for request, metadata in zip(batch.requests, batch.kv_cache_metadata)
+    ),
+    sampling_metadata=(
+        SamplingMetadata(temp, top_p, top_k) for request in batch.requests
+    ),
+    kv_cache_metadata=batch.kv_cache_metadata,  # 逻辑块地址等
+)
+
+responses = executor.collective_rpc(
+    "execute_model",
+    runner_input,
+    runner_group=0,
+)
+
+# 仅 output rank 返回 ModelRunnerOutput，其他 rank 返回 None
+output = responses[output_rank_index]
+executor._pending_step = RunnerStepId(runner_group=0, step_id=step_counter)
+return ModelForwardOutput(runner_step_id=executor._pending_step)
+```
+
+关键点：
+- `query_len`：prefill 时为整个 prompt + output，decode 时仅为最后 1 token
+- 采样参数由 Scheduler 中的 `request.sampling` 提供
+- KV cache metadata 由 Scheduler.prepare_step() 返回
+- 仅 output rank 返回 logits，其他 rank 参与 allreduce 但返回 None
+
+#### 3. Sample Tokens
+
+```python
+step = output.runner_step_id  # 已保存在 _pending_step
+
+responses = executor.collective_rpc(
+    "sample_tokens",
+    step.step_id,
+    runner_group=step.runner_group,
+)
+
+token_ids = responses[output_rank_index]
+executor._pending_step = None
+return token_ids
+```
+
+采样必须在 forward 之后、下一次 forward 之前调用。若规则违反，抛 RuntimeError。
+
+### 两种实现
+
+#### UniProcModelExecutor（单卡或单进程）
+
+```python
+class UniProcModelExecutor(ModelExecutor):
+    def _init_executor(self):
+        # 创建 1 个 GPUWorker (rank=0) 在当前进程
+        spec = topology.runner_group_specs[0]
+        worker = GPUWorker(config=..., rank=0, ...)
+        worker.init_device()  # CUDA device 初始化
+        worker.load_model()   # 权重加载
+        self.runner_groups = (RunnerGroup(spec, (LocalWorkerHandle(0, worker),)),)
+        
+    def collective_rpc(method, args, runner_group=0):
+        # 直接调用 worker.method(*args)，无 RPC
+        handle = self.runner_groups[0].worker_handles[0]
+        return (handle.worker.method(*args),)
+```
+
+优点：
+- 无进程间通信开销
+- 调试��� CPU 测试方便
+
+缺点：
+- 无法利用多卡
+
+#### MultiprocModelExecutor（多卡 TP）
+
+```python
+class MultiprocModelExecutor(ModelExecutor):
+    def _init_executor(self):
+        # 为每个 TP rank 创建 1 个子进程
+        for rank in range(topology.tensor_parallel_size):
+            spec = topology.runner_group_specs[rank]
+            process = spawn_worker_process(rank, spec, ...)
+            handle = ProcessWorkerHandle(process, ...)
+            self.runner_groups = (RunnerGroup(..., (handle, ...)),)
+        
+    def collective_rpc(method, args, runner_group=0):
+        # 向所有子进程发送 RPC 请求，等待响应
+        for handle in group.worker_handles:
+            handle.send(method, args)
+        responses = []
+        for handle in group.worker_handles:
+            responses.append(handle.recv(timeout=...))
+        return tuple(responses)
+```
+
+优点：
+- 支持多卡 TP
+- 隔离进程内存空间
+
+缺点：
+- 进程管理和 IPC 复杂
+- 需要处理进程崩溃等异常
+
+### RunnerGroup 和 WorkerHandle
+
+```python
+@dataclass(slots=True)
+class RunnerGroup:
+    spec: RunnerGroupSpec           # TP rank list, output rank 等
+    worker_handles: tuple[WorkerHandle, ...]  # 该组内的所有 worker 句柄
+
+class WorkerHandle(Protocol):
+    def send(method: str, args) -> None: ...     # 异步发送 RPC
+    def recv(timeout) -> Any: ...                # 同步接收 RPC 响应
+    def check_health() -> None: ...              # 健康检查
+    
+class LocalWorkerHandle(WorkerHandle):
+    """单卡/单进程：直接调用"""
+    def __init__(rank: int, worker: GPUWorker):
+        self.worker = worker
+    def send(method, args):
+        self.response = getattr(worker, method)(*args)
+    def recv(timeout):
+        return self.response
+        
+class ProcessWorkerHandle(WorkerHandle):
+    """多进程 TP：通过 queue 或 pipe 通信"""
+    def __init__(rank: int, process: subprocess.Process):
+        self.rank = rank
+        self.process = process
+        self.send_queue = ...
+        self.recv_queue = ...
+    def send(method, args):
+        self.send_queue.put((method, args))
+    def recv(timeout):
+        return self.recv_queue.get(timeout=timeout)
+```
+
+### 与 Scheduler 的协作
+
+```
+Scheduler                          ModelExecutor
+
+schedule()
+  ├─ admit requests
+  ├─ select batch & phase
+  └─ kv_cache_manager.prepare_step()
+    ↓ SchedulerOutput
+    │  (requests, phase, kv_cache_metadata)
+    │
+execute_model(batch)
+  ├─ Translate SchedulerOutput to ModelRunnerInput
+  │  - Extract query token IDs (last query_len tokens)
+  │  - Pack sampling metadata
+  │  - Pass KV block addresses
+  └─ RPC to workers
+    ↓ ModelForwardOutput
+    │
+sample_tokens(output, batch)
+  └─ RPC to workers
+    ↓ token_ids
+    │
+update_from_output(batch, token_ids, eos_ids)
+  ├─ kv_cache_manager.commit_step()
+  ├─ Check finish reason (EOS / LENGTH)
+  └─ SchedulerUpdate
+```
+
+ModelExecutor 必须正确转译 KV cache metadata：
+- Prefill：所有 layer 的 KV 块按顺序追加
+- Decode：复用上一步的 KV 块，追加新 token 的块
+
+WorkerHandle 收到块地址后，通过内部 `BlockPool` 查找对应的物理存储位置。
+
+## KV Cache 初始化
+
+```python
+def _initialize_kv_cache(self):
+    # 1. Query worker capacities
+    capacities = self.collective_rpc("get_kv_cache_capacity", kv_cache_config)
+    
+    # 2. Take minimum (单个 TP rank 的最小容量)
+    self.num_gpu_blocks = min(capacities)
+    
+    # 3. Notify all workers
+    self.collective_rpc(
+        "initialize_kv_cache",
+        self.num_gpu_blocks,
+        kv_cache_config.block_size,
+    )
+    
+    # 4. Scheduler 使用该值创建 KVCacheManager
+    # (见 EngineCore.__init__)
+```
+
+## 错误处理与健康检查
+
+```python
+def check_health(self):
+    # 检查是否有待处理的采样操作
+    if self._pending_step is not None:
+        raise RuntimeError("pending sampled output")
+    
+    # 检查所有 worker
+    for group in self.runner_groups:
+        for handle in group.worker_handles:
+            handle.check_health()
+    
+def shutdown(self):
+    for group in self.runner_groups:
+        for handle in group.worker_handles:
+            handle.shutdown()  # 关闭子进程、清理资源
+    self.runner_groups = ()
+```
+
+若任何 collective RPC 抛异常，立即设置 `_failed_error`，后续所有操作都会先检查此状态并抛 RuntimeError。
+
+## 测试与评估
+
+- **单卡 (uni backend)**：CPU 和 GPU 上运行小模型 forward 和采样
+- **多卡 (mp backend, TP=2)**：在 2 块 GPU 上运行 Qwen3-MoE，验证 allreduce 和 block 分发
+- **RPC 超时**：模拟 worker 卡住，验证 recv(timeout) 行为
+- **KV cache 容量**：多个请求并发，验证块的分配和释放
+- **Worker 崩溃**：模拟子进程 crash，验证健康检查和异常处理
+- 单元测试见 `tests/executor/test_model_executor.py`
+
+## 权衡与已知问题
+
+### 优势
+
+- **统一接口**：EngineCore 无需知道单卡 vs 多卡实现细节
+- **灵活的并行维度**：虽然当前仅 TP，架构预留 PP/EP/DP 扩展空间
+- **隔离进程**：多卡 TP 时各 rank 内存独立，无法被其他 rank 污染
+- **同步接口**：forward 和 采样分离，易于调试和状态跟踪
+
+### 局限
+
+- **仅 TP**：PP 和 EP 需要不同的 batch 管理策略
+- **无动态并行度**：运行时无法改变 TP size
+- **进程管理复杂**：多进程实现需要处理各种进程通信和崩溃场景
+- **采样必须两步**：forward 后必须立即调用 sample_tokens；无法异步采样
+
+### 未来扩展
+
+1. **管道并行 (PP)**：需要 bubble scheduling 或 megatron-style pipeline
+2. **专家并行 (EP)**：需要 MoE-specific 的 all-to-all 通信
+3. **异步执行**：forward 和 采样解耦，并行执行多个 step
+4. **多副本支持**：支持多个独立模型副本或 MoE group 副本
+
+## 结论
+
+ModelExecutor 是 xTokens 中执行层的统一入口，屏蔽单卡 vs 多卡 TP 的实现差异。通过 collective RPC 和 WorkerHandle 抽象，支持灵活的并行实现。与 Scheduler 的 KV cache metadata 紧密协作，确保分块 KV 缓存的逻辑地址一致性。设计完全位于 P1/P2 边界，为 EngineCore 提供稳定的执行接口。
+
+## 完成标准
+
+- 实现与 `x_tokens/executor/model_executor.py`、`uniproc_model_executor.py`、`multiproc_model_executor.py` 代码一致
+- 单元测试覆盖单卡执行、多卡 TP、KV cache 初始化、错误处理等
+- 集成测试验证 EngineCore.step_fn() 中 execute_model + sample_tokens 流程
+- 文档中的接口和流程图与代码对应
+- 支持 Qwen3-30B-A3B 在 TP=2 下的推理基线

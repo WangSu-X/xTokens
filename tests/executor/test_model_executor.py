@@ -10,7 +10,7 @@ from x_tokens.core.scheduler import (
     SchedulerOutput,
     SchedulerPhase,
 )
-from x_tokens.engine.types import GenerateRequest, SamplingParams
+from x_tokens.engine.protocol import GenerateRequest, SamplingParams
 from x_tokens.executor import (
     ModelExecutor,
     MultiprocModelExecutor,
@@ -94,7 +94,6 @@ def test_uniproc_executor_runs_pending_step_and_samples_on_device() -> None:
     try:
         output = executor.execute_model(scheduled)
 
-        assert output.logits is None
         assert output.runner_step_id is not None
         assert executor.sample_tokens(output, scheduled) == (3, 5)
         assert executor.eos_token_ids == frozenset((15,))
@@ -138,24 +137,15 @@ def test_executor_rejects_execute_execute_without_sampling() -> None:
         executor.shutdown()
 
 
-def test_custom_executor_rejects_batch_without_kv_metadata() -> None:
-    executor = UniProcModelExecutor(
-        ParallelConfig(devices=("cpu",), collective_backend="gloo"),
-        runner_factory(),
-        kv_cache_config=cache_config(),
-    )
+def test_scheduler_output_rejects_batch_without_kv_metadata() -> None:
     request = GenerateRequest(
         "missing-metadata",
         "tiny",
         (1,),
         SamplingParams(max_tokens=1, temperature=0),
     )
-    scheduled = SchedulerOutput((ScheduledRequest(request, (1,)),))
-    try:
-        with pytest.raises(ValueError, match="requires KV cache metadata"):
-            executor.execute_model(scheduled)
-    finally:
-        executor.shutdown()
+    with pytest.raises(ValueError, match="KV cache metadata batch size mismatch"):
+        SchedulerOutput((ScheduledRequest(request, (1,)),))
 
 
 def test_executor_rejects_reserved_parallel_execution_modes() -> None:

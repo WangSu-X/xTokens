@@ -1,5 +1,17 @@
 # 设计文档：Token-ID EngineCore
 
+> 历史方案更新：当前只有具体实现 `Scheduler`，KV cache 为必需能力；`EngineCoreConfig` 必须提供已解析 block 数的 `kv_cache_config`。旧 `NaiveScheduler`、`KVCacheScheduler`、scheduler factory 和无 cache 分支已删除，下文相关兼容方案不再适用。当前测试位于 `tests/engine/test_engine_core.py`。
+
+## 架构位置
+
+本设计属于 xTokens 三层分布式架构的 **P1 - EngineCore** 层（见 S0-arch.md）：
+
+- **P0 - API Server**：OpenAI HTTP 服务、请求转换（见 S1-serve_api.md）
+- **P1 - EngineCore**：单线程事件循环、请求调度、KV cache 管理、执行协调、事件汇聚
+- **P2 - ModelRunner**：SPMD 并行执行、模型 forward、采样（见 S4-custom_model.md）
+
+本设计涉及的核心组件：`EngineCore`、`Scheduler`（与 `KVCacheManager`，见 S8-kv_cache.md）、`Executor` 协议、`NaiveScheduler` 默认实现、`GenerateRequest` 和 `EngineCoreOutputs` 数据结构。
+
 ## 摘要
 
 `EngineCore` is a synchronous, backend-independent token-ID execution loop. It validates requests,
@@ -32,12 +44,12 @@ implementation, while the protocol allows future scheduling strategies.
 
 ```mermaid
 flowchart LR
-    Engine[LLMEngine] --> Client[EngineCoreClient]
-    Client --> Core[EngineCore]
-    Core --> Scheduler[Scheduler protocol]
-    Scheduler -. default implementation .-> Naive[NaiveScheduler]
-    Core --> Executor[Executor protocol]
-    Executor -. implementation .-> HF[NaiveHFExecutor]
+    Engine["P0: LLMEngine"] --> Client[EngineCoreClient]
+    Client --> Core["P1: EngineCore"]
+    Core --> Scheduler["P1: Scheduler protocol"]
+    Scheduler -. default implementation .-> Naive["P1: NaiveScheduler + KVCacheManager"]
+    Core --> Executor["P1/P2 boundary: Executor protocol"]
+    Executor -. implementation .-> Exec["P2: ModelExecutor"]
 ```
 
 `EngineCore` 只拥有 `EngineCoreConfig`、`Scheduler`、`Executor` 和待投递的错误事件。默认使用 `NaiveScheduler`，也可以在构造时注入其他 `Scheduler` 实现。`InprocClient` 通过可选的 `scheduler_factory` 创建 scheduler；未提供时按 `EngineCoreConfig` 创建 `NaiveScheduler`。

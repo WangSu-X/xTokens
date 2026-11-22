@@ -2,171 +2,32 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import asynccontextmanager
-from dataclasses import replace
+import contextlib
+import logging
+from collections.abc import AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from x_tokens.config import XTokensConfig
-from x_tokens.core import (
-    EngineCoreConfig,
-    KVCacheScheduler,
-    NaiveScheduler,
-    Scheduler,
-)
-from x_tokens.engine.clients.inproc import InprocClient, SchedulerFactory
-from x_tokens.engine.input_processor import TokenizerInputProcessor
-from x_tokens.engine.llm_engine import LLMEngine, LLMEngineProtocol
-from x_tokens.engine.output_processor import TokenizerOutputProcessor
-from x_tokens.executor.base import Executor
-from x_tokens.executor.naive_hf_executor import (
-    NaiveHFExecutor,
-    NaiveHFExecutorConfig,
-)
-from x_tokens.logger import init_logger
+from x_tokens.engine.llm_engine import LLMEngine
+from x_tokens.entrypoints.serve.auth_middleware import APIKeyMiddleware
+from x_tokens.entrypoints.serve.errors import OpenAIError
+from x_tokens.entrypoints.serve.routes import chat, completions, models
+from x_tokens.entrypoints.serve.services.chat_service import ChatCompletionService
+from x_tokens.entrypoints.serve.services.completion_service import CompletionService
 
-from .config import ServeConfig
-from .errors import OpenAIError
-from .generation import ChatCompletionService, GenerationService
-from .models import ModelRegistry
-from .openai.routes import ServeServices, router
-from .renderer import PlainTextPromptRenderer
-
-EngineFactory = Callable[[XTokensConfig], LLMEngineProtocol]
-ExecutorFactory = Callable[[NaiveHFExecutorConfig], Executor]
-CustomExecutorFactory = Callable[[XTokensConfig, int, frozenset[int]], Executor]
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def _default_executor_factory(config: NaiveHFExecutorConfig) -> NaiveHFExecutor:
-    return NaiveHFExecutor(config)
+def create_app(config: XTokensConfig | None = None) -> FastAPI:
+    """Create the OpenAI-compatible API application."""
+    config = config or XTokensConfig()
 
-
-def _default_scheduler_factory(config: EngineCoreConfig) -> Scheduler:
-    if config.kv_cache_config is None:
-        return NaiveScheduler(
-            max_num_seqs=config.max_num_seqs,
-            max_model_len=config.max_model_len,
-        )
-    return KVCacheScheduler(
-        max_num_seqs=config.max_num_seqs,
-        max_model_len=config.max_model_len,
-        kv_cache_config=config.kv_cache_config,
-        model_fingerprint=config.model_aliases[0],
-    )
-
-
-class RequestBodyLimitMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: FastAPI, max_body_size: int) -> None:
-        super().__init__(app)
-        self._max_body_size = max_body_size
-
-    async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
-        content_length = request.headers.get("content-length")
-        if content_length is not None and int(content_length) > self._max_body_size:
-            return JSONResponse(
-                OpenAIError(
-                    413,
-                    "Request body is too large",
-                    "invalid_request_error",
-                    code="request_too_large",
-                ).body(),
-                status_code=413,
-            )
-        return await call_next(request)
-
-
-def default_engine_factory(
-    config: XTokensConfig,
-    *,
-    executor_factory: ExecutorFactory = _default_executor_factory,
-    custom_executor_factory: CustomExecutorFactory | None = None,
-    scheduler_factory: SchedulerFactory = _default_scheduler_factory,
-) -> LLMEngineProtocol:
-    """Build the single-process Hugging Face EngineCore path."""
-    model_config = config.model_config
-    executor_config = config.executor_config
-    processor = TokenizerInputProcessor.from_config(
-        model_config.model_name,
-        local_files_only=executor_config.local_files_only,
-    )
-    if executor_config.backend == "naive_hf":
-        hf_executor_config = NaiveHFExecutorConfig(
-            model_config.model_name,
-            device=executor_config.device,
-            dtype=executor_config.dtype,
-            local_files_only=executor_config.local_files_only,
-            pad_token_id=processor.pad_token_id,
-            eos_token_ids=processor.eos_token_ids,
-        )
-        executor = executor_factory(hf_executor_config)
-    else:
-        if custom_executor_factory is None:
-            from x_tokens.executor.custom_factory import (
-                create_registered_model_executor,
-            )
-
-            custom_executor_factory = create_registered_model_executor
-        executor = custom_executor_factory(
-            config, processor.pad_token_id, processor.eos_token_ids
-        )
-    kv_cache_config = None
-    if executor_config.backend == "custom":
-        num_gpu_blocks = getattr(executor, "num_gpu_blocks", 0)
-        if num_gpu_blocks < 1:
-            raise RuntimeError("custom executor did not initialize KV cache")
-        kv_cache_config = replace(
-            config.kv_cache_config,
-            num_gpu_blocks=num_gpu_blocks,
-        )
-    core_config = EngineCoreConfig(
-        (model_config.served_model_name,),
-        max_model_len=model_config.max_model_len,
-        max_num_seqs=config.scheduler_config.max_num_seqs,
-        kv_cache_config=kv_cache_config,
-    )
-    return LLMEngine(
-        InprocClient(
-            core_config,
-            lambda: executor,
-            scheduler_factory=scheduler_factory,
-        ),
-        processor,
-        TokenizerOutputProcessor(processor.tokenizer),
-    )
-
-
-def _validation_error(exc: RequestValidationError) -> OpenAIError:
-    first = exc.errors()[0] if exc.errors() else {}
-    location = first.get("loc", ())
-    param = str(location[-1]) if location else None
-    return OpenAIError(
-        422,
-        "Invalid request parameters",
-        "invalid_request_error",
-        param,
-        "validation_error",
-    )
-
-
-def create_app(
-    config: XTokensConfig | ServeConfig | None = None,
-    engine_factory: EngineFactory = default_engine_factory,
-) -> FastAPI:
-    """Create an app with injected Engine dependencies and no module-global Engine."""
-    if config is None:
-        config = XTokensConfig()
-    elif isinstance(config, ServeConfig):
-        config = config.to_xtokens_config()
-    server_config = config.server_config
-
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info(
             "serve engine initializing: served_model=%s model=%s "
             "max_model_len=%d max_num_seqs=%d",
@@ -175,59 +36,58 @@ def create_app(
             config.model_config.max_model_len,
             config.scheduler_config.max_num_seqs,
         )
-        try:
-            engine = engine_factory(config)
-        except Exception:
-            logger.exception("serve engine initialization failed")
-            raise
-        models = ModelRegistry(config.model_config.served_model_name)
-        completions = GenerationService(
-            engine,
-            models,
-            shutdown_policy=server_config.shutdown_policy,
-            shutdown_timeout_s=server_config.shutdown_timeout_s,
-        )
-        chat = ChatCompletionService(
-            engine,
-            models,
-            PlainTextPromptRenderer(),
-            shutdown_policy=server_config.shutdown_policy,
-            shutdown_timeout_s=server_config.shutdown_timeout_s,
-        )
-        app.state.serve_services = ServeServices(
-            server_config, engine, models, completions, chat
-        )
-        ready = await completions.refresh_readiness()
-        logger.info("serve engine ready: ready=%s", ready)
+        engine = LLMEngine(config)
+        app.state.engine = engine
+        app.state.completion_service = CompletionService(engine)
+        app.state.chat_service = ChatCompletionService(engine)
+
+        health = await engine.health()
+        if health.ready:
+            logger.info("serve engine ready: ready=True")
+        else:
+            logger.warning("serve engine not ready: %s", health.detail)
+
         try:
             yield
         finally:
             logger.info("serve engine shutting down")
-            try:
-                await app.state.serve_services.close()
-            finally:
-                logger.info("serve engine stopped")
+            await engine.close()
+            logger.info("serve engine stopped")
 
-    app = FastAPI(title="xTokens Serve API", lifespan=lifespan)
-    app.add_middleware(
-        RequestBodyLimitMiddleware, max_body_size=server_config.max_request_body_size
+    app = FastAPI(
+        title="xTokens Inference Server",
+        version="0.1.0",
+        description="OpenAI-compatible LLM inference server",
+        lifespan=lifespan,
     )
-    if server_config.cors_origins:
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=list(server_config.cors_origins),
-            allow_methods=["GET", "POST"],
-            allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
-        )
-
-    @app.exception_handler(OpenAIError)
-    async def openai_error(_: Request, exc: OpenAIError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content=exc.body())
+    app.state.config = config
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(config.server_config.cors_origins) or ["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    if config.server_config.api_key:
+        app.add_middleware(APIKeyMiddleware, api_key=config.server_config.api_key)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
-        error = _validation_error(exc)
-        return JSONResponse(status_code=error.status_code, content=error.body())
+        errors = exc.errors()
+        location = errors[0].get("loc", ()) if errors else ()
+        param = str(location[-1]) if location else None
+        return JSONResponse(
+            status_code=422,
+            content=OpenAIError(
+                422,
+                "Invalid request parameters",
+                "invalid_request_error",
+                param,
+                "validation_error",
+            ).body(),
+        )
 
-    app.include_router(router)
+    app.include_router(models.router)
+    app.include_router(completions.router)
+    app.include_router(chat.router)
     return app

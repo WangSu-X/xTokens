@@ -12,13 +12,19 @@ from x_tokens.logger import init_logger
 from x_tokens.modeling import ModelInput, ModelOutput
 from x_tokens.worker.kv_cache import GPUKVCache
 
-from .base import ModelRunnerInput, ModelRunnerOutput, SamplingMetadata
+from .base import (
+    ModelRunner,
+    ModelRunnerFactory,
+    ModelRunnerInput,
+    ModelRunnerOutput,
+    SamplingMetadata,
+)
 
 logger = init_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
-class GPUModelRunnerFactory:
+class GPUModelRunnerFactory(ModelRunnerFactory):
     """Pickle-friendly factory used by uni and spawn-based mp executors."""
 
     model_factory: Callable[[ParallelContext], Any]
@@ -35,7 +41,7 @@ class GPUModelRunnerFactory:
         )
 
 
-class GPUModelRunner:
+class GPUModelRunner(ModelRunner):
     def __init__(
         self,
         context: ParallelContext,

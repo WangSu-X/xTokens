@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
+
+from x_tokens.config import XTokensConfig
 
 if TYPE_CHECKING:
     from x_tokens.core.scheduler import SchedulerOutput
 
+    from .model_executor import RunnerStepId
+
 
 class Executor(Protocol):
     """Model execution backend consumed by EngineCore."""
+
+    num_gpu_blocks: int
 
     @property
     def eos_token_ids(self) -> frozenset[int]: ...
@@ -22,14 +29,11 @@ class Executor(Protocol):
     ) -> tuple[int, ...]: ...
 
 
+ExecutorFactory = Callable[[XTokensConfig, int, frozenset[int]], Executor]
+
+
 @dataclass(frozen=True, slots=True)
 class ModelForwardOutput:
-    """Normalized output of one model forward pass.
+    """Handle to rank-local state awaiting device-side sampling."""
 
-    ``logits`` contains the final-position logits for each request in batch
-    order. Optional model state is reserved for future KV-cache executors.
-    """
-
-    logits: Any = None
-    past_key_values: Any | None = None
-    runner_step_id: Any | None = None
+    runner_step_id: RunnerStepId | None = None
