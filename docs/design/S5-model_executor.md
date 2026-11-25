@@ -48,7 +48,7 @@ EngineCore 需要一个执行后端来完成模型前向和采样。直接调用
 
 ```
 EngineCore
-    ↓ SchedulerOutput (requests, phase, kv_cache_metadata)
+    ↓ SchedulerOutput (running_requests, num_scheduled_tokens)
     ↓
 ModelExecutor (control plane)
     ├─ execute_model(batch)
@@ -126,18 +126,7 @@ executor = ModelExecutor.get_class(parallel_config)(
 #### 2. Execute Forward
 
 ```python
-runner_input = ModelRunnerInput(
-    step_id=step_counter,
-    token_ids=(
-        # 对每个请求，取最后 query_len 个 token
-        request.context_token_ids[-metadata.query_len:]
-        for request, metadata in zip(batch.requests, batch.kv_cache_metadata)
-    ),
-    sampling_metadata=(
-        SamplingMetadata(temp, top_p, top_k) for request in batch.requests
-    ),
-    kv_cache_metadata=batch.kv_cache_metadata,  # 逻辑块地址等
-)
+runner_input = executor._prepare_step(batch)
 
 responses = executor.collective_rpc(
     "execute_model",
@@ -147,15 +136,11 @@ responses = executor.collective_rpc(
 
 # 仅 output rank 返回 ModelRunnerOutput，其他 rank 返回 None
 output = responses[output_rank_index]
-executor._pending_step = RunnerStepId(runner_group=0, step_id=step_counter)
-return ModelForwardOutput(runner_step_id=executor._pending_step)
+executor.pending_step = RunnerStepId(runner_group=0, step_id=step_counter)
+return ModelForwardOutput(runner_step_id=executor.pending_step)
 ```
 
-关键点：
-- `query_len`：prefill 时为整个 prompt + output，decode 时仅为最后 1 token
-- 采样参数由 Scheduler 中的 `request.sampling` 提供
-- KV cache metadata 由 Scheduler.prepare_step() 返回
-- 仅 output rank 返回 logits，其他 rank 参与 allreduce 但返回 None
+`_prepare_step()` 将各请求本步的 token 区间、起始位置和 block IDs 组装成 `ModelRunnerRequest`。如果这段 token 覆盖请求全部待计算位置，就附上采样参数。各 rank 的 Runner 计算本地 KV slot，输出 rank 返回计算结果。
 
 #### 3. Sample Tokens
 
@@ -169,7 +154,7 @@ responses = executor.collective_rpc(
 )
 
 token_ids = responses[output_rank_index]
-executor._pending_step = None
+executor.pending_step = None
 return token_ids
 ```
 
@@ -273,15 +258,15 @@ class ProcessWorkerHandle(WorkerHandle):
 Scheduler                          ModelExecutor
 
 schedule()
-  ├─ admit requests
-  ├─ select batch & phase
-  └─ kv_cache_manager.prepare_step()
+  ├─ assign token budget to running and waiting requests
+  ├─ kv_cache_manager.allocate_slots()
+  └─ kv_cache_manager.get_block_ids()
     ↓ SchedulerOutput
-    │  (requests, phase, kv_cache_metadata)
+    │  (running_requests, num_scheduled_tokens)
     │
 execute_model(batch)
   ├─ Translate SchedulerOutput to ModelRunnerInput
-  │  - Extract query token IDs (last query_len tokens)
+  │  - Slice token IDs from the computed prefix
   │  - Pack sampling metadata
   │  - Pass KV block addresses
   └─ RPC to workers
@@ -292,16 +277,12 @@ sample_tokens(output, batch)
     ↓ token_ids
     │
 update_from_output(batch, token_ids, eos_ids)
-  ├─ kv_cache_manager.commit_step()
+  ├─ kv_cache_manager.cache_blocks()
   ├─ Check finish reason (EOS / LENGTH)
   └─ SchedulerUpdate
 ```
 
-ModelExecutor 必须正确转译 KV cache metadata：
-- Prefill：所有 layer 的 KV 块按顺序追加
-- Decode：复用上一步的 KV 块，追加新 token 的块
-
-WorkerHandle 收到块地址后，通过内部 `BlockPool` 查找对应的物理存储位置。
+Runner 根据 `ModelRunnerRequest` 中的 token 位置和 block IDs 计算 `slot_mapping`，供每个 rank 的 `GPUKVCache` 读写。
 
 ## KV Cache 初始化
 
@@ -329,7 +310,7 @@ def _initialize_kv_cache(self):
 ```python
 def check_health(self):
     # 检查是否有待处理的采样操作
-    if self._pending_step is not None:
+    if self.pending_step is not None:
         raise RuntimeError("pending sampled output")
     
     # 检查所有 worker
@@ -349,7 +330,7 @@ def shutdown(self):
 ## 测试与评估
 
 - **单卡 (uni backend)**：CPU 和 GPU 上运行小模型 forward 和采样
-- **多卡 (mp backend, TP=2)**：在 2 块 GPU 上运行 Qwen3-MoE，验证 allreduce 和 block 分发
+- **多卡 (mp backend, TP=2)**：在 2 块 GPU 上运行 Qwen3.5，验证 allreduce 和 block 分发
 - **RPC 超时**：模拟 worker 卡住，验证 recv(timeout) 行为
 - **KV cache 容量**：多个请求并发，验证块的分配和释放
 - **Worker 崩溃**：模拟子进程 crash，验证健康检查和异常处理
@@ -388,4 +369,4 @@ ModelExecutor 是 xTokens 中执行层的统一入口，屏蔽单卡 vs 多卡 T
 - 单元测试覆盖单卡执行、多卡 TP、KV cache 初始化、错误处理等
 - 集成测试验证 EngineCore.step_fn() 中 execute_model + sample_tokens 流程
 - 文档中的接口和流程图与代码对应
-- 支持 Qwen3-30B-A3B 在 TP=2 下的推理基线
+- 支持 Qwen3.5 在 TP=2 下的推理

@@ -5,39 +5,52 @@ import pytest
 from x_tokens.modeling.registry import DEFAULT_MODEL_REGISTRY
 
 
-def test_registry_prefers_declared_architecture() -> None:
+@pytest.mark.parametrize(
+    ("architecture", "model_type"),
+    [
+        ("Qwen3_5ForCausalLM", "qwen3_5_text"),
+        ("Qwen3_5ForConditionalGeneration", "qwen3_5"),
+    ],
+)
+def test_registry_resolves_declared_architecture(
+    architecture: str, model_type: str
+) -> None:
     registration = DEFAULT_MODEL_REGISTRY.resolve(
         {
-            "architectures": ["Qwen3MoeForCausalLM"],
-            "model_type": "qwen3_moe",
+            "architectures": [architecture],
+            "model_type": model_type,
         }
     )
 
-    assert registration.architecture == "Qwen3MoeForCausalLM"
+    assert registration.architecture == architecture
     assert callable(registration.runner_factory_builder)
 
 
 def test_registry_falls_back_to_unique_model_type() -> None:
-    registration = DEFAULT_MODEL_REGISTRY.resolve({"model_type": "qwen3_moe"})
+    registration = DEFAULT_MODEL_REGISTRY.resolve({"model_type": "qwen3_5"})
 
-    assert registration.architecture == "Qwen3MoeForCausalLM"
+    assert registration.architecture == "Qwen3_5ForConditionalGeneration"
 
 
 def test_registry_rejects_architecture_model_type_mismatch() -> None:
-    with pytest.raises(ValueError, match="expects model_type qwen3_moe"):
+    with pytest.raises(ValueError, match="expects model_type qwen3_5_text"):
         DEFAULT_MODEL_REGISTRY.resolve(
             {
-                "architectures": ["Qwen3MoeForCausalLM"],
-                "model_type": "qwen3",
+                "architectures": ["Qwen3_5ForCausalLM"],
+                "model_type": "qwen3_5",
             }
         )
 
 
-def test_registry_rejects_unknown_model() -> None:
+@pytest.mark.parametrize(
+    ("architecture", "model_type"),
+    [("UnknownForCausalLM", "unknown"), ("Qwen3MoeForCausalLM", "qwen3_moe")],
+)
+def test_registry_rejects_unsupported_model(architecture: str, model_type: str) -> None:
     with pytest.raises(ValueError, match="unsupported or ambiguous"):
         DEFAULT_MODEL_REGISTRY.resolve(
             {
-                "architectures": ["UnknownForCausalLM"],
-                "model_type": "unknown",
+                "architectures": [architecture],
+                "model_type": model_type,
             }
         )

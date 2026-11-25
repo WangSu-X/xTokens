@@ -1,14 +1,13 @@
 """Model execution backends."""
 
-from .base import Executor, ModelForwardOutput
 from .custom_factory import create_registered_model_executor
 from .model_executor import (
     ModelExecutor,
     RunnerGroup,
-    RunnerStepId,
     create_model_executor,
 )
 from .multiproc_model_executor import MultiprocModelExecutor
+from .protocol import Executor, ModelForwardOutput, RunnerStepId
 from .uniproc_model_executor import UniProcModelExecutor
 
 __all__ = [

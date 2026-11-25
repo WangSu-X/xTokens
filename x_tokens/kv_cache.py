@@ -6,23 +6,30 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
-class KVCacheMetadata:
-    request_id: str
-    is_prefill: bool
+class KVCacheSlots:
     context_len: int
-    query_len: int
-    block_table: tuple[int, ...]
+    block_ids: tuple[int, ...]
     slot_mapping: tuple[int, ...]
 
-    def __post_init__(self) -> None:
-        if self.context_len < 1:
-            raise ValueError("KV cache context_len must be positive")
-        if self.query_len < 1 or self.query_len > self.context_len:
-            raise ValueError("KV cache query_len must be in [1, context_len]")
-        if len(self.slot_mapping) != self.query_len:
-            raise ValueError("slot_mapping must contain one slot per query token")
-        if not self.block_table:
-            raise ValueError("block_table must not be empty")
+    @property
+    def query_len(self) -> int:
+        return len(self.slot_mapping)
+
+
+@dataclass(frozen=True, slots=True)
+class LinearAttentionCacheSpec:
+    num_layers: int
+    conv_channels: int
+    conv_history: int
+    num_heads: int
+    key_head_dim: int
+    value_head_dim: int
+
+    def bytes_per_block(self, dtype_bytes: int) -> int:
+        return self.num_layers * (
+            self.conv_channels * self.conv_history * dtype_bytes
+            + self.num_heads * self.key_head_dim * self.value_head_dim * 4
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,10 +39,11 @@ class KVCacheSpec:
     num_kv_heads: int
     head_dim: int
     dtype_bytes: int
+    linear_attention: LinearAttentionCacheSpec | None = None
 
     @property
     def bytes_per_block(self) -> int:
-        return (
+        attention_bytes = (
             self.num_layers
             * 2
             * self.block_size
@@ -43,3 +51,6 @@ class KVCacheSpec:
             * self.head_dim
             * self.dtype_bytes
         )
+        if self.linear_attention is None:
+            return attention_bytes
+        return attention_bytes + self.linear_attention.bytes_per_block(self.dtype_bytes)

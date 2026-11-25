@@ -1,6 +1,6 @@
 # 设计文档：Token-ID EngineCore
 
-> 历史方案更新：当前只有具体实现 `Scheduler`，KV cache 为必需能力；`EngineCoreConfig` 必须提供已解析 block 数的 `kv_cache_config`。旧 `NaiveScheduler`、`KVCacheScheduler`、scheduler factory 和无 cache 分支已删除，下文相关兼容方案不再适用。当前测试位于 `tests/engine/test_engine_core.py`。
+> 当前 `EngineCore` 根据 `EngineCoreConfig` 构建 Executor，再按实际 KV cache 容量构建 `Scheduler`。文中涉及 `NaiveScheduler`、`KVCacheScheduler`、scheduler factory 和无 cache 分支的内容属于历史方案。当前测试位于 `tests/engine/test_engine_core.py`。
 
 ## 架构位置
 
@@ -10,14 +10,11 @@
 - **P1 - EngineCore**：单线程事件循环、请求调度、KV cache 管理、执行协调、事件汇聚
 - **P2 - ModelRunner**：SPMD 并行执行、模型 forward、采样（见 S4-custom_model.md）
 
-本设计涉及的核心组件：`EngineCore`、`Scheduler`（与 `KVCacheManager`，见 S8-kv_cache.md）、`Executor` 协议、`NaiveScheduler` 默认实现、`GenerateRequest` 和 `EngineCoreOutputs` 数据结构。
+本设计涉及的核心组件：`EngineCore`、`Scheduler`（与 `KVCacheManager`，见 S8-kv_cache.md）、`Executor` 协议、`NaiveScheduler` 默认实现、`EngineCoreRequest` 和 `EngineCoreOutputs` 数据结构。
 
 ## 摘要
 
-`EngineCore` is a synchronous, backend-independent token-ID execution loop. It validates requests,
-delegates admission and lifecycle updates to the injected `Scheduler`, delegates model execution and
-sampling to the injected `Executor`, and emits normalized Core events. `NaiveScheduler` is the default
-implementation, while the protocol allows future scheduling strategies.
+`EngineCore` 负责校验 token ID 请求，由自身创建的 `Scheduler` 管理请求生命周期，并由 `Executor` 执行模型推理与采样。Core 根据执行结果生成请求输出。
 
 ## 背景
 
@@ -27,7 +24,7 @@ implementation, while the protocol allows future scheduling strategies.
 
 ## 目标
 
-- 仅接收 `GenerateRequest.prompt: tuple[int, ...]`，拒绝文本 prompt。
+- 仅接收包含 prompt token IDs 的 `EngineCoreRequest`。
 - 负责模型别名和 sampling 参数校验、FIFO 准入、运行状态、取消和关闭。
 - 每次 `step_fn()` 至多执行一次 batch forward，并输出 `CoreTokenEvent`、`CoreFinishedEvent` 或 `CoreErrorEvent`。
 - 仅依赖 `Executor` protocol，使 `NaiveHFExecutor` 可以替换为其他执行后端。
@@ -52,16 +49,16 @@ flowchart LR
     Executor -. implementation .-> Exec["P2: ModelExecutor"]
 ```
 
-`EngineCore` 只拥有 `EngineCoreConfig`、`Scheduler`、`Executor` 和待投递的错误事件。默认使用 `NaiveScheduler`，也可以在构造时注入其他 `Scheduler` 实现。`InprocClient` 通过可选的 `scheduler_factory` 创建 scheduler；未提供时按 `EngineCoreConfig` 创建 `NaiveScheduler`。
+`EngineCoreConfig` 保存 `XTokensConfig` 和 tokenizer 提供的 pad/EOS token ID。Core 构造时先通过注册模型工厂创建 Executor，再把实际的 `num_gpu_blocks` 交给 Scheduler。Scheduler 初始化失败时，Core 关闭已创建的 Executor。
 
-Serve 层的 `default_engine_factory` 同样接受可选的 `executor_factory` 和 `scheduler_factory`。`ServeConfig` 只承载可序列化的模型与运行参数，factory 用于替换 Python 实现，避免将 callable 放入配置对象。
+单进程客户端在本进程创建 Core，多进程客户端把配置交给 Core 子进程。可选的 `executor_factory` 用于替换默认工厂。
 
 ## 详细设计
 
 ### 核心流程
 
-1. Engine 预处理文本为 token IDs，并调用 `EngineCore.add_request()`。
-2. Core 校验模型、token-ID 类型与 sampling；失败则暂存 `CoreErrorEvent`，成功则加入 waiting 队列。
+1. Engine 预处理文本为 token IDs。多进程 Core 的 `process_input_sockets` 线程读取 ZMQ 消息中的 `request_type`，并按请求类型处理。收到 ADD 时，通过 `decode_core_request()` 校验模型与 prompt 并构造 `EngineCoreRequest`。单进程客户端直接构造同一类型。
+2. `EngineCore.add_request()` 校验采样参数，Scheduler 校验准入条件并将同一个请求实例加入 waiting 队列。请求校验失败时返回 `CoreErrorEvent`。
 3. `step_fn()` 先取出暂存事件，再由 `Scheduler.schedule()` 将请求填入 running batch；默认实现以 FIFO 纳入请求，上限为 `max_num_seqs`。
 4. Core 调用 `Executor.execute_model(SchedulerOutput)` 获取 `ModelForwardOutput`。
 5. Core 将 forward 输出交给 `Executor.sample_tokens(output, SchedulerOutput)`，每个 running request 得到一个 token ID。
@@ -72,13 +69,15 @@ Serve 层的 `default_engine_factory` 同样接受可选的 `executor_factory` �
 ```mermaid
 sequenceDiagram
     participant E as LLMEngine
+    participant I as EngineCoreClient
     participant C as EngineCore
-    participant S as NaiveScheduler
+    participant S as Scheduler
     participant X as Executor
 
-    E->>C: add_request(request with token IDs)
-    C->>S: add_request()
-    E->>C: step_fn()
+    E->>I: add_request(GenerateRequest)
+    I->>C: add_request(EngineCoreRequest)
+    C->>S: add_request(EngineCoreRequest)
+    C->>C: step_fn()
     C->>S: schedule()
     S-->>C: SchedulerOutput
     C->>X: execute_model(SchedulerOutput)
@@ -89,7 +88,7 @@ sequenceDiagram
     C-->>E: EngineCoreOutputs
 ```
 
-`abort_requests()` 可从 waiting 或 running 移除 request。`close()` 标记 Core closed 并 abort 全部 scheduler 请求；关闭后的新增请求会产生 `CoreErrorEvent`。
+`abort_requests()` 可从 waiting 或 running 移除请求。多进程 Core 收到 CLOSE 后结束输入处理，由循环入口的 `_handle_shutdown()` 调用 `close()`，取消剩余的请求并关闭 Executor。
 
 ### 接口与数据结构
 
@@ -105,15 +104,15 @@ class Executor(Protocol):
 class Scheduler(Protocol):
     @property
     def has_work(self) -> bool: ...
-    def add_request(self, request: GenerateRequest, prompt_token_ids: tuple[int, ...]) -> None: ...
+    def add_request(self, request: EngineCoreRequest) -> None: ...
     def schedule(self) -> SchedulerOutput: ...
     def update_from_output(
         self, batch: SchedulerOutput, token_ids: tuple[int, ...], *,
         eos_token_ids: frozenset[int]
     ) -> tuple[SchedulerUpdate, ...]: ...
-    def fail_batch(self, batch: SchedulerOutput) -> tuple[ScheduledRequest, ...]: ...
+    def fail_batch(self, batch: SchedulerOutput) -> tuple[EngineCoreRequest, ...]: ...
     def abort(self, request_id: str) -> bool: ...
-    def abort_all(self) -> tuple[ScheduledRequest, ...]: ...
+    def abort_all(self) -> tuple[EngineCoreRequest, ...]: ...
 
 @dataclass(frozen=True, slots=True)
 class ModelForwardOutput:
@@ -121,7 +120,7 @@ class ModelForwardOutput:
     past_key_values: Any | None = None
 
 class EngineCore:
-    def add_request(self, request: GenerateRequest) -> None: ...
+    def add_request(self, request: EngineCoreRequest) -> None: ...
     def abort_requests(self, request_ids: tuple[str, ...]) -> None: ...
     def step_fn(self) -> tuple[EngineCoreOutputs, bool]: ...
     def post_step(self, *, model_executed: bool) -> None: ...
@@ -130,10 +129,10 @@ class EngineCore:
 
 | 类型 | 职责 |
 | --- | --- |
-| `EngineCoreConfig` | 模型别名、最大模型长度和最大并发序列数。 |
+| `EngineCoreConfig` | 构建 Core 所需的运行配置和 tokenizer ID。 |
 | `Scheduler` | 调度、输出更新、失败清理和取消的接口；`update_from_output()` 返回 `SchedulerUpdate`，由 Core 转换为 `EngineCoreOutputs`。 |
 | `NaiveScheduler` | `Scheduler` 的 FIFO、无 KV cache 默认实现。 |
-| `ScheduledRequest` | 已处理 prompt token IDs、输出 token IDs 与调度状态。 |
+| `EngineCoreRequest` | Core 内唯一的请求实体，持有 prompt 和输出 token IDs、采样参数、调度和终止状态、已计算 token 数及完整前缀块 hash。 |
 | `EngineCoreOutputs` | 按 output channel 组织的本 step Core events；当前使用 channel `0`。 |
 
 ### 状态图

@@ -1,7 +1,7 @@
 """xTokens-owned model contracts and implementations."""
 
-from .config import ModelLoadConfig, Qwen3MoeModelConfig
-from .interfaces import (
+from .config import ModelLoadConfig
+from .protocol import (
     IntermediateTensors,
     ModelInput,
     ModelOutput,
@@ -9,6 +9,7 @@ from .interfaces import (
     TensorShard,
     XTokensModel,
 )
+from .qwen3_5_config import Qwen3_5TextConfig
 from .registry import ModelRegistration, ModelRegistry, resolve_model_registration
 
 __all__ = [
@@ -19,7 +20,7 @@ __all__ = [
     "ModelRegistration",
     "ModelRegistry",
     "ParameterShardSpec",
-    "Qwen3MoeModelConfig",
+    "Qwen3_5TextConfig",
     "TensorShard",
     "XTokensModel",
     "resolve_model_registration",

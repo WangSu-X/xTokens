@@ -4,14 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from x_tokens.config import XTokensConfig
 
 if TYPE_CHECKING:
-    from x_tokens.core.scheduler import SchedulerOutput
-
-    from .model_executor import RunnerStepId
+    from x_tokens.core.protocol import SchedulerOutput
 
 
 class Executor(Protocol):
@@ -33,7 +31,23 @@ ExecutorFactory = Callable[[XTokensConfig, int, frozenset[int]], Executor]
 
 
 @dataclass(frozen=True, slots=True)
+class RunnerStepId:
+    runner_group: int
+    step_id: int
+
+
+@dataclass(frozen=True, slots=True)
 class ModelForwardOutput:
     """Handle to rank-local state awaiting device-side sampling."""
 
     runner_step_id: RunnerStepId | None = None
+
+
+class WorkerHandle(Protocol):
+    rank: int
+
+    def send(self, method: str, args: tuple[Any, ...]) -> None: ...
+
+    def recv(self, timeout_s: float) -> Any: ...
+
+    def check_health(self) -> None: ...

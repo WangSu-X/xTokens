@@ -2,16 +2,34 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
+
+if TYPE_CHECKING:
+    from x_tokens.config import XTokensConfig
+    from x_tokens.executor.protocol import ExecutorFactory
 
 
 class FinishReason(StrEnum):
     STOP = "stop"
     LENGTH = "length"
     CANCELLED = "cancelled"
+
+
+class EngineCoreRequestType(StrEnum):
+    ADD = "add_request"
+    ABORT = "abort_requests"
+    CLOSE = "close"
+
+
+class RequestStatus(StrEnum):
+    WAITING = "waiting"
+    RUNNING = "running"
+    FINISHED = "finished"
+    ABORTED = "aborted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +54,61 @@ class GenerateRequest:
     sampling: SamplingParams
     priority: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class EngineCoreRequest:
+    request_id: str
+    sampling_params: SamplingParams
+    prompt_token_ids: tuple[int, ...]
+    status: RequestStatus = RequestStatus.WAITING
+    stop_reason: FinishReason | None = None
+    output_token_ids: list[int] = field(default_factory=list)
+    num_computed_tokens: int = 0
+    block_hashes: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_input(
+        cls,
+        request_id: str,
+        sampling_params: SamplingParams,
+        prompt: str | tuple[int, ...],
+        *,
+        model: str,
+        served_model_name: str,
+    ) -> EngineCoreRequest:
+        if model != served_model_name:
+            raise ValueError("requested model is not loaded by this EngineCore")
+        if not isinstance(prompt, tuple):
+            raise TypeError("EngineCore requires preprocessed prompt token IDs")
+        return cls(request_id, sampling_params, prompt)
+
+    @property
+    def all_token_ids(self) -> tuple[int, ...]:
+        return self.prompt_token_ids + tuple(self.output_token_ids)
+
+    @property
+    def prompt_tokens(self) -> int:
+        return len(self.prompt_token_ids)
+
+    @property
+    def completion_tokens(self) -> int:
+        return len(self.output_token_ids)
+
+    @property
+    def needs_prefill(self) -> bool:
+        return self.num_computed_tokens < self.prompt_tokens
+
+    @property
+    def num_uncomputed_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens - self.num_computed_tokens
+
+
+type EngineCoreInput = (
+    tuple[Literal[EngineCoreRequestType.ADD], EngineCoreRequest]
+    | tuple[Literal[EngineCoreRequestType.ABORT], tuple[str, ...]]
+    | tuple[Literal[EngineCoreRequestType.CLOSE], None]
+)
 
 
 class InputProcessor(Protocol):
@@ -100,17 +173,23 @@ class CoreErrorEvent:
     retryable: bool = False
 
 
-CoreEvent = CoreTokenEvent | CoreFinishedEvent | CoreErrorEvent
+CoreRequestOutput = CoreTokenEvent | CoreFinishedEvent | CoreErrorEvent
 
 
-def encode_core_request(request: GenerateRequest) -> dict[str, Any]:
+def encode_core_request(
+    request: GenerateRequest, *, include_prompt: bool = True
+) -> dict[str, Any]:
     sampling = request.sampling
     return {
         "request_id": request.request_id,
         "model": request.model,
         "prompt": (
-            list(request.prompt) if isinstance(request.prompt, tuple) else request.prompt
-        ),
+            list(request.prompt)
+            if isinstance(request.prompt, tuple)
+            else request.prompt
+        )
+        if include_prompt
+        else None,
         "prompt_is_tokens": isinstance(request.prompt, tuple),
         "sampling": {
             "max_tokens": sampling.max_tokens,
@@ -125,14 +204,25 @@ def encode_core_request(request: GenerateRequest) -> dict[str, Any]:
     }
 
 
-def decode_core_request(data: dict[str, Any]) -> GenerateRequest:
-    prompt = tuple(data["prompt"]) if data["prompt_is_tokens"] else data["prompt"]
+def decode_core_request(
+    data: dict[str, Any],
+    *,
+    served_model_name: str,
+    token_frame: bytes | None = None,
+) -> EngineCoreRequest:
+    if token_frame is not None:
+        prompt = tuple(memoryview(token_frame).cast("q"))
+    elif data["prompt_is_tokens"]:
+        prompt = tuple(data["prompt"])
+    else:
+        prompt = data["prompt"]
     sampling = data["sampling"]
-    return GenerateRequest(
+    return EngineCoreRequest.from_input(
         request_id=data["request_id"],
         model=data["model"],
+        served_model_name=served_model_name,
         prompt=prompt,
-        sampling=SamplingParams(
+        sampling_params=SamplingParams(
             max_tokens=sampling["max_tokens"],
             temperature=sampling["temperature"],
             top_p=sampling["top_p"],
@@ -140,37 +230,35 @@ def decode_core_request(data: dict[str, Any]) -> GenerateRequest:
             stop=tuple(sampling["stop"]),
             ignore_eos=sampling["ignore_eos"],
         ),
-        priority=data["priority"],
-        metadata=data["metadata"],
     )
 
 
-def encode_core_event(event: CoreEvent) -> dict[str, Any]:
-    if isinstance(event, CoreTokenEvent):
+def encode_core_event(request_output: CoreRequestOutput) -> dict[str, Any]:
+    if isinstance(request_output, CoreTokenEvent):
         return {
             "type": "token",
-            "request_id": event.request_id,
-            "token_id": event.token_id,
+            "request_id": request_output.request_id,
+            "token_id": request_output.token_id,
         }
-    if isinstance(event, CoreFinishedEvent):
+    if isinstance(request_output, CoreFinishedEvent):
         return {
             "type": "finished",
-            "request_id": event.request_id,
-            "finish_reason": event.finish_reason.value,
-            "prompt_tokens": event.prompt_tokens,
-            "completion_tokens": event.completion_tokens,
+            "request_id": request_output.request_id,
+            "finish_reason": request_output.finish_reason.value,
+            "prompt_tokens": request_output.prompt_tokens,
+            "completion_tokens": request_output.completion_tokens,
         }
-    if isinstance(event, CoreErrorEvent):
+    if isinstance(request_output, CoreErrorEvent):
         return {
             "type": "error",
-            "request_id": event.request_id,
-            "message": event.message,
-            "retryable": event.retryable,
+            "request_id": request_output.request_id,
+            "message": request_output.message,
+            "retryable": request_output.retryable,
         }
-    raise TypeError(f"unsupported Core event: {type(event)!r}")
+    raise TypeError(f"unsupported Core request output: {type(request_output)!r}")
 
 
-def decode_core_event(data: dict[str, Any]) -> CoreEvent:
+def decode_core_event(data: dict[str, Any]) -> CoreRequestOutput:
     if data["type"] == "token":
         return CoreTokenEvent(data["request_id"], data["token_id"])
     if data["type"] == "finished":
@@ -189,6 +277,46 @@ def decode_core_event(data: dict[str, Any]) -> CoreEvent:
 class EngineHealth:
     ready: bool
     detail: str = ""
+
+
+class EngineCoreClient(ABC):
+    """Transport boundary used by LLMEngine to drive EngineCore."""
+
+    @staticmethod
+    def make_client(
+        config: XTokensConfig,
+        *,
+        pad_token_id: int,
+        eos_token_ids: frozenset[int],
+        executor_factory: ExecutorFactory | None = None,
+    ) -> EngineCoreClient:
+        from .core_client import InProcessClient, MultiProcessClient
+
+        mode = config.server_config.core_client_mode
+        if mode == "in_proc":
+            return InProcessClient(
+                config, pad_token_id, eos_token_ids, executor_factory
+            )
+        if mode == "multi_proc":
+            return MultiProcessClient(
+                config, pad_token_id, eos_token_ids, executor_factory
+            )
+        raise ValueError(f"unsupported EngineCore client mode: {mode}")
+
+    @abstractmethod
+    def add_request(self, request: GenerateRequest) -> None: ...
+
+    @abstractmethod
+    async def get_output(self) -> tuple[CoreRequestOutput, ...]: ...
+
+    @abstractmethod
+    def abort_requests(self, request_ids: tuple[str, ...]) -> None: ...
+
+    @abstractmethod
+    def health(self) -> EngineHealth: ...
+
+    @abstractmethod
+    def close(self) -> None: ...
 
 
 class LLMEngineProtocol(Protocol):

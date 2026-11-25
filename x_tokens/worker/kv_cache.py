@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from x_tokens.kv_cache import KVCacheMetadata, KVCacheSpec
+from x_tokens.kv_cache import KVCacheSlots, KVCacheSpec
 
 
 class GPUKVCache:
@@ -25,7 +25,7 @@ class GPUKVCache:
             raise ValueError("num_blocks must be positive")
         self.spec = spec
         self.num_blocks = num_blocks
-        self._torch = torch_module
+        self.torch_module = torch_module
         self.storage = torch_module.empty(
             spec.num_layers,
             2,
@@ -36,15 +36,59 @@ class GPUKVCache:
             device=device,
             dtype=dtype,
         )
+        self.conv_states = None
+        self.recurrent_states = None
+        linear = spec.linear_attention
+        if linear is not None:
+            self.conv_states = torch_module.empty(
+                linear.num_layers,
+                num_blocks,
+                linear.conv_channels,
+                linear.conv_history,
+                device=device,
+                dtype=dtype,
+            )
+            self.recurrent_states = torch_module.empty(
+                linear.num_layers,
+                num_blocks,
+                linear.num_heads,
+                linear.key_head_dim,
+                linear.value_head_dim,
+                device=device,
+                dtype=torch_module.float32,
+            )
 
     @property
     def allocated_bytes(self) -> int:
-        return self.storage.numel() * self.storage.element_size()
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (self.storage, self.conv_states, self.recurrent_states)
+            if tensor is not None
+        )
+
+    def linear_state(self, layer_index: int, block_id: int | None) -> tuple[Any, Any]:
+        if self.conv_states is None or self.recurrent_states is None:
+            raise ValueError("KV cache does not provide linear attention state")
+        if block_id is None:
+            return (
+                self.torch_module.zeros_like(self.conv_states[layer_index, 0]),
+                self.torch_module.zeros_like(self.recurrent_states[layer_index, 0]),
+            )
+        return self.conv_states[layer_index, block_id], self.recurrent_states[
+            layer_index, block_id
+        ]
+
+    def write_linear_state(
+        self, layer_index: int, block_id: int, conv_state: Any, recurrent_state: Any
+    ) -> None:
+        conv, recurrent = self.linear_state(layer_index, block_id)
+        conv.copy_(conv_state)
+        recurrent.copy_(recurrent_state)
 
     def write(
         self,
         layer_index: int,
-        metadata: tuple[KVCacheMetadata, ...],
+        metadata: tuple[KVCacheSlots, ...],
         key: Any,
         value: Any,
     ) -> None:
@@ -55,9 +99,9 @@ class GPUKVCache:
         key_cache = self.storage[layer_index, 0]
         value_cache = self.storage[layer_index, 1]
         for batch_index, item in enumerate(metadata):
-            slots = self._torch.tensor(
+            slots = self.torch_module.tensor(
                 item.slot_mapping,
-                dtype=self._torch.long,
+                dtype=self.torch_module.long,
                 device=self.storage.device,
             )
             block_ids = slots // self.spec.block_size
@@ -70,7 +114,7 @@ class GPUKVCache:
     def gather(
         self,
         layer_index: int,
-        metadata: tuple[KVCacheMetadata, ...],
+        metadata: tuple[KVCacheSlots, ...],
     ) -> tuple[Any, Any]:
         max_context_len = max(item.context_len for item in metadata)
         shape = (
@@ -79,20 +123,18 @@ class GPUKVCache:
             self.spec.num_kv_heads,
             self.spec.head_dim,
         )
-        key = self._torch.zeros(
+        key = self.torch_module.zeros(
             shape, dtype=self.storage.dtype, device=self.storage.device
         )
-        value = self._torch.zeros_like(key)
+        value = self.torch_module.zeros_like(key)
         for batch_index, item in enumerate(metadata):
-            block_ids = self._torch.tensor(
-                item.block_table,
-                dtype=self._torch.long,
+            if any(not 0 <= block_id < self.num_blocks for block_id in item.block_ids):
+                raise ValueError("KV cache block table contains an invalid block ID")
+            block_ids = self.torch_module.tensor(
+                item.block_ids,
+                dtype=self.torch_module.long,
                 device=self.storage.device,
             )
-            if bool((block_ids < 0).any()) or bool(
-                (block_ids >= self.num_blocks).any()
-            ):
-                raise ValueError("KV cache block table contains an invalid block ID")
             gathered_key = self.storage[layer_index, 0].index_select(0, block_ids)
             gathered_value = self.storage[layer_index, 1].index_select(0, block_ids)
             key[batch_index, : item.context_len] = gathered_key.reshape(
@@ -105,3 +147,7 @@ class GPUKVCache:
 
     def clear(self) -> None:
         self.storage.zero_()
+        if self.conv_states is not None:
+            self.conv_states.zero_()
+        if self.recurrent_states is not None:
+            self.recurrent_states.zero_()

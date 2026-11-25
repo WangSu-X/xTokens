@@ -3,27 +3,17 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from x_tokens.config import ParallelConfig
 
-from .config import ModelLoadConfig, Qwen3MoeModelConfig
+from .config import ModelLoadConfig
 from .loader.source import ResolvedModelSource
-
-ConfigAdapter = Callable[[Mapping[str, Any]], Qwen3MoeModelConfig]
-
-
-class RunnerFactoryBuilder(Protocol):
-    def __call__(
-        self,
-        source: ResolvedModelSource,
-        model_config: Qwen3MoeModelConfig,
-        load_config: ModelLoadConfig,
-        pad_token_id: int,
-    ) -> object: ...
+from .protocol import ConfigAdapter, RunnerFactoryBuilder
+from .qwen3_5_config import Qwen3_5TextConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,21 +26,21 @@ class ModelRegistration:
 
 class ModelRegistry:
     def __init__(self) -> None:
-        self._architectures: dict[str, ModelRegistration] = {}
-        self._model_types: dict[str, list[ModelRegistration]] = {}
+        self.architectures: dict[str, ModelRegistration] = {}
+        self.model_types: dict[str, list[ModelRegistration]] = {}
 
     def register(self, registration: ModelRegistration) -> None:
-        if registration.architecture in self._architectures:
+        if registration.architecture in self.architectures:
             raise ValueError(
                 f"duplicate model architecture: {registration.architecture}"
             )
-        self._architectures[registration.architecture] = registration
-        self._model_types.setdefault(registration.model_type, []).append(registration)
+        self.architectures[registration.architecture] = registration
+        self.model_types.setdefault(registration.model_type, []).append(registration)
 
     def resolve(self, hf_config: Mapping[str, Any]) -> ModelRegistration:
         architectures = tuple(str(item) for item in hf_config.get("architectures", ()))
         for architecture in architectures:
-            registration = self._architectures.get(architecture)
+            registration = self.architectures.get(architecture)
             if registration is None:
                 continue
             model_type = str(hf_config.get("model_type", ""))
@@ -61,10 +51,10 @@ class ModelRegistry:
                 )
             return registration
         model_type = str(hf_config.get("model_type", ""))
-        candidates = self._model_types.get(model_type, ())
+        candidates = self.model_types.get(model_type, ())
         if len(candidates) == 1:
             return candidates[0]
-        supported = ", ".join(sorted(self._architectures)) or "<none>"
+        supported = ", ".join(sorted(self.architectures)) or "<none>"
         raise ValueError(
             f"unsupported or ambiguous model architecture; declared={architectures}, "
             f"model_type={model_type!r}, supported={supported}"
@@ -75,7 +65,7 @@ class ModelRegistry:
 class ResolvedModelRegistration:
     source: ResolvedModelSource
     registration: ModelRegistration
-    config: Qwen3MoeModelConfig
+    config: Qwen3_5TextConfig
 
 
 def resolve_model_registration(
@@ -98,27 +88,26 @@ def resolve_model_registration(
 DEFAULT_MODEL_REGISTRY = ModelRegistry()
 
 
-def _create_qwen3_moe_runner_factory(
+def _create_qwen3_5_runner_factory(
     source: ResolvedModelSource,
-    model_config: Qwen3MoeModelConfig,
+    model_config: Qwen3_5TextConfig,
     load_config: ModelLoadConfig,
     pad_token_id: int,
 ) -> object:
-    from .models.qwen3_moe import Qwen3MoeRunnerFactory
+    from .models.qwen3_5 import Qwen3_5RunnerFactory
 
-    return Qwen3MoeRunnerFactory(
-        source,
-        model_config,
-        load_config,
-        pad_token_id,
+    return Qwen3_5RunnerFactory(source, model_config, load_config, pad_token_id)
+
+
+for architecture, model_type in (
+    ("Qwen3_5ForConditionalGeneration", "qwen3_5"),
+    ("Qwen3_5ForCausalLM", "qwen3_5_text"),
+):
+    DEFAULT_MODEL_REGISTRY.register(
+        ModelRegistration(
+            architecture,
+            model_type,
+            Qwen3_5TextConfig.from_hf_config,
+            _create_qwen3_5_runner_factory,
+        )
     )
-
-
-DEFAULT_MODEL_REGISTRY.register(
-    ModelRegistration(
-        "Qwen3MoeForCausalLM",
-        "qwen3_moe",
-        Qwen3MoeModelConfig.from_hf_config,
-        _create_qwen3_moe_runner_factory,
-    )
-)

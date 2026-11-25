@@ -5,18 +5,14 @@ import torch
 from torch import nn
 
 from x_tokens.config import KVCacheConfig, ParallelConfig
-from x_tokens.core.scheduler import (
-    ScheduledRequest,
-    SchedulerOutput,
-    SchedulerPhase,
-)
-from x_tokens.engine.protocol import GenerateRequest, SamplingParams
+from x_tokens.core.protocol import SchedulerOutput, SchedulerRequest
+from x_tokens.engine.protocol import EngineCoreRequest, SamplingParams
 from x_tokens.executor import (
     ModelExecutor,
     MultiprocModelExecutor,
     UniProcModelExecutor,
 )
-from x_tokens.kv_cache import KVCacheMetadata, KVCacheSpec
+from x_tokens.kv_cache import KVCacheSpec
 from x_tokens.modeling import ModelInput, ModelOutput
 from x_tokens.worker.model_runner import GPUModelRunnerFactory
 
@@ -53,26 +49,16 @@ def tiny_model_factory(context: object) -> TinyNextTokenModel:
 
 def batch(*contexts: tuple[int, ...]) -> SchedulerOutput:
     requests = []
+    num_scheduled_tokens = {}
     for index, context in enumerate(contexts):
-        request = GenerateRequest(
+        request = EngineCoreRequest(
             f"request-{index}",
-            "tiny",
-            context,
             SamplingParams(max_tokens=2, temperature=0),
+            context,
         )
-        requests.append(ScheduledRequest(request, context))
-    metadata = tuple(
-        KVCacheMetadata(
-            request_id=request.request_id,
-            is_prefill=True,
-            context_len=len(context),
-            query_len=len(context),
-            block_table=(index,),
-            slot_mapping=tuple(index * 4 + offset for offset in range(len(context))),
-        )
-        for index, (request, context) in enumerate(zip(requests, contexts, strict=True))
-    )
-    return SchedulerOutput(tuple(requests), SchedulerPhase.PREFILL, metadata)
+        requests.append(SchedulerRequest(request, (index,)))
+        num_scheduled_tokens[request.request_id] = len(context)
+    return SchedulerOutput(tuple(requests), num_scheduled_tokens)
 
 
 def runner_factory() -> GPUModelRunnerFactory:
@@ -137,15 +123,34 @@ def test_executor_rejects_execute_execute_without_sampling() -> None:
         executor.shutdown()
 
 
-def test_scheduler_output_rejects_batch_without_kv_metadata() -> None:
-    request = GenerateRequest(
-        "missing-metadata",
-        "tiny",
-        (1,),
-        SamplingParams(max_tokens=1, temperature=0),
+def test_executor_resolves_fixed_kv_bytes_to_logical_blocks() -> None:
+    config = KVCacheConfig(block_size=4, memory_bytes=8 * 32 + 31)
+    executor = UniProcModelExecutor(
+        ParallelConfig(devices=("cpu",), collective_backend="gloo"),
+        runner_factory(),
+        kv_cache_config=config,
     )
-    with pytest.raises(ValueError, match="KV cache metadata batch size mismatch"):
-        SchedulerOutput((ScheduledRequest(request, (1,)),))
+    try:
+        assert executor.num_gpu_blocks == 8
+    finally:
+        executor.shutdown()
+
+
+def test_executor_shuts_down_workers_when_cache_initialization_fails() -> None:
+    class TrackedExecutor(UniProcModelExecutor):
+        def shutdown(self) -> None:
+            super().shutdown()
+            assert not self.runner_groups
+            shutdowns.append(self)
+
+    shutdowns = []
+    with pytest.raises(ValueError, match="CPU KV cache requires num_gpu_blocks"):
+        TrackedExecutor(
+            ParallelConfig(devices=("cpu",), collective_backend="gloo"),
+            runner_factory(),
+            kv_cache_config=KVCacheConfig(),
+        )
+    assert len(shutdowns) == 1
 
 
 def test_executor_rejects_reserved_parallel_execution_modes() -> None:
@@ -162,7 +167,7 @@ def test_executor_rejects_reserved_parallel_execution_modes() -> None:
         )
 
 
-def test_multiproc_executor_runs_tp_spmd_on_cpu_gloo() -> None:
+def test_multiproc_executor_runs_tp_spmd_on_cpu_gloo(monkeypatch) -> None:
     executor = MultiprocModelExecutor(
         ParallelConfig(
             distributed_executor_backend="mp",
@@ -176,6 +181,17 @@ def test_multiproc_executor_runs_tp_spmd_on_cpu_gloo() -> None:
     )
     scheduled = batch((7,), (2, 8))
     try:
+        collective_rpc = executor.collective_rpc
+        methods = []
+
+        def record_method(method, *args, **kwargs):
+            methods.append(method)
+            return collective_rpc(method, *args, **kwargs)
+
+        monkeypatch.setattr(executor, "collective_rpc", record_method)
+        assert executor.execute_step(scheduled) == (8, 9)
+        assert methods == ["execute_and_sample"]
+
         output = executor.execute_model(scheduled)
 
         assert executor.sample_tokens(output, scheduled) == (8, 9)

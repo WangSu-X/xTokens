@@ -1,8 +1,9 @@
 """Service-facing inference interfaces."""
 
-from .core_client import EngineCoreClient, InProcessClient, MultiProcessClient
+from .core_client import InProcessClient, MultiProcessClient
 from .llm_engine import LLMEngine
 from .protocol import (
+    EngineCoreClient,
     EngineEvent,
     EngineHealth,
     GenerateRequest,

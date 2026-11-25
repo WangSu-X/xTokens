@@ -28,10 +28,18 @@ class ModelConfig:
 @dataclass(frozen=True, slots=True)
 class SchedulerConfig:
     max_num_seqs: int = 4
+    max_prefill_batch_tokens: int | None = None
+    enable_chunked_prefill: bool = False
+    prefill_chunk_alignment: int | None = None
 
     def __post_init__(self) -> None:
         if self.max_num_seqs < 1:
             raise ValueError("max_num_seqs must be positive")
+        if (
+            self.max_prefill_batch_tokens is not None
+            and self.max_prefill_batch_tokens < 1
+        ):
+            raise ValueError("max_prefill_batch_tokens must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +54,7 @@ class KVCacheConfig:
     gpu_memory_utilization: float = 0.9
     num_gpu_blocks: int | None = None
     enable_prefix_caching: bool = True
+    memory_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if self.block_size < 1:
@@ -54,6 +63,13 @@ class KVCacheConfig:
             raise ValueError("gpu_memory_utilization must be in (0, 1]")
         if self.num_gpu_blocks is not None and self.num_gpu_blocks < 1:
             raise ValueError("num_gpu_blocks must be positive")
+        if self.memory_bytes is not None:
+            if self.memory_bytes < 1:
+                raise ValueError("KV cache memory_bytes must be positive")
+            if self.num_gpu_blocks is not None:
+                raise ValueError(
+                    "KV cache memory_bytes and num_gpu_blocks are mutually exclusive"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +153,7 @@ class ServerConfig:
     max_request_body_size: int = 4 * 1024 * 1024
     cors_origins: tuple[str, ...] = ()
     access_log: bool = True
-    core_client_mode: Literal["in_proc", "multi_proc"] = "in_proc"
+    core_client_mode: Literal["in_proc", "multi_proc"] = "multi_proc"
 
     def __post_init__(self) -> None:
         if self.port < 1 or self.port > 65535:
@@ -158,3 +174,23 @@ class XTokensConfig:
     kv_cache_config: KVCacheConfig = field(default_factory=KVCacheConfig)
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
     server_config: ServerConfig = field(default_factory=ServerConfig)
+
+    def __post_init__(self) -> None:
+        if self.scheduler_config.enable_chunked_prefill:
+            budget = self.scheduler_config.max_prefill_batch_tokens
+            if budget is None or budget < self.kv_cache_config.block_size:
+                raise ValueError(
+                    "chunked prefill requires a budget of at least one KV block"
+                )
+        alignment = self.scheduler_config.prefill_chunk_alignment
+        if alignment is not None:
+            budget = self.scheduler_config.max_prefill_batch_tokens
+            if (
+                not self.scheduler_config.enable_chunked_prefill
+                or budget is None
+                or not 0 < alignment <= budget
+                or alignment % self.kv_cache_config.block_size
+            ):
+                raise ValueError(
+                    "prefill chunk alignment must be a KV block multiple within the chunked budget"
+                )

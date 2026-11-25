@@ -1,35 +1,130 @@
-"""Logical block manager for KV cache and prefix reuse."""
+"""KV block allocation, ownership, and automatic prefix caching."""
 
 from __future__ import annotations
 
 import hashlib
-import math
-from collections import deque
+import struct
 from dataclasses import dataclass, field
 
 from x_tokens.config import KVCacheConfig
-from x_tokens.kv_cache import KVCacheMetadata
+
+from ..engine.protocol import EngineCoreRequest
 
 
 class KVCacheCapacityError(RuntimeError):
     """Raised when no physical block can be allocated."""
 
 
-@dataclass(slots=True)
-class KVCacheBlock:
+@dataclass(slots=True, eq=False)
+class KVBlock:
     block_id: int
-    block_hash: bytes | None = None
+    block_hash: str | None = None
     token_ids: tuple[int, ...] = ()
-    ref_count: int = 0
-    computed: bool = False
-    last_access: int = 0
+    ref_cnt: int = 0
+    prev_free_block: KVBlock | None = field(default=None, repr=False)
+    next_free_block: KVBlock | None = field(default=None, repr=False)
 
 
-@dataclass(slots=True)
-class RequestKVCacheState:
-    request_id: str
-    block_ids: list[int] = field(default_factory=list)
-    num_computed_tokens: int = 0
+class FreeBlockQueue:
+    """FIFO of unreferenced blocks with constant-time removal for prefix hits."""
+
+    def __init__(self) -> None:
+        self.head: KVBlock | None = None
+        self.tail: KVBlock | None = None
+        self.size = 0
+
+    def push_tail(self, block: KVBlock) -> None:
+        block.prev_free_block = self.tail
+        if self.tail is None:
+            self.head = block
+        else:
+            self.tail.next_free_block = block
+        self.tail = block
+        self.size += 1
+
+    def pop_head(self) -> KVBlock:
+        block = self.head
+        if block is None:
+            raise KVCacheCapacityError("KV cache has no evictable block")
+        self.remove(block)
+        return block
+
+    def remove(self, block: KVBlock) -> None:
+        previous = block.prev_free_block
+        following = block.next_free_block
+        if previous is None:
+            self.head = following
+        else:
+            previous.next_free_block = following
+        if following is None:
+            self.tail = previous
+        else:
+            following.prev_free_block = previous
+        block.prev_free_block = None
+        block.next_free_block = None
+        self.size -= 1
+
+    def move_to_tail(self, block: KVBlock) -> None:
+        if block is not self.tail:
+            self.remove(block)
+            self.push_tail(block)
+
+
+class BlockPool:
+    """Own all logical block IDs and the index of reusable full blocks."""
+
+    def __init__(self, num_blocks: int) -> None:
+        self.blocks = [KVBlock(block_id) for block_id in range(num_blocks)]
+        self.hash_to_block: dict[str, KVBlock] = {}
+        self.free_queue = FreeBlockQueue()
+        self.evictions = 0
+        for block in self.blocks:
+            self.free_queue.push_tail(block)
+
+    def allocate(self) -> KVBlock:
+        block = self.free_queue.pop_head()
+        if block.block_hash is not None:
+            self._evict(block)
+        block.ref_cnt = 1
+        return block
+
+    def release(self, block: KVBlock) -> None:
+        if block.ref_cnt < 1:
+            raise RuntimeError("KV cache block ref count underflow")
+        block.ref_cnt -= 1
+        if block.ref_cnt > 0:
+            return
+        if (
+            block.block_hash is not None
+            and self.hash_to_block.setdefault(block.block_hash, block) is not block
+        ):
+            # The other copy remains the reusable block.
+            block.block_hash = None
+            block.token_ids = ()
+        self.free_queue.push_tail(block)
+
+    def lookup(self, block_hash: str) -> KVBlock | None:
+        return self.hash_to_block.get(block_hash)
+
+    def lookup_and_acquire(self, block_hash: str) -> KVBlock | None:
+        block = self.lookup(block_hash)
+        if block is not None:
+            if block.ref_cnt == 0:
+                self.free_queue.remove(block)
+            block.ref_cnt += 1
+        return block
+
+    def insert(self, block_hash: str, block: KVBlock) -> None:
+        block.block_hash = block_hash
+        self.hash_to_block.setdefault(block_hash, block)
+
+    def _evict(self, block: KVBlock) -> None:
+        block_hash = block.block_hash
+        if block_hash is not None and self.hash_to_block.get(block_hash) is block:
+            del self.hash_to_block[block_hash]
+        block.block_hash = None
+        block.token_ids = ()
+        self.evictions += 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +139,7 @@ class KVCacheStats:
 
 
 class KVCacheManager:
-    """Driver-owned logical cache state; workers only consume block metadata."""
+    """Assign blocks from the pool and register completed request prefixes."""
 
     def __init__(
         self,
@@ -58,235 +153,145 @@ class KVCacheManager:
             raise ValueError("num_blocks must be positive")
         if num_blocks * config.block_size < max_model_len:
             raise ValueError("KV cache must hold at least one max_model_len sequence")
-        self.config = config
-        self.num_blocks = num_blocks
+        self.block_size = config.block_size
+        self.enable_prefix_caching = config.enable_prefix_caching
         self.max_model_len = max_model_len
         self.model_fingerprint = model_fingerprint.encode("utf-8")
-        self.blocks = [KVCacheBlock(index) for index in range(num_blocks)]
-        self._free_block_ids = deque(range(num_blocks))
-        self._hash_to_block_id: dict[bytes, int] = {}
-        self._requests: dict[str, RequestKVCacheState] = {}
-        self._clock = 0
-        self._prefix_hits = 0
-        self._prefix_misses = 0
-        self._evictions = 0
+        self.pack_tokens = struct.Struct(f"<{self.block_size}q")
+        self.block_pool = BlockPool(num_blocks)
+        self.req_to_blocks: dict[str, list[KVBlock]] = {}
+        self.num_cached_blocks: dict[str, int] = {}
+        self.prepared_token_ids: dict[str, tuple[int, ...]] = {}
+        self.prefix_hits = 0
+        self.prefix_misses = 0
 
-    def admit(self, request_id: str, token_ids: tuple[int, ...]) -> bool:
-        if request_id in self._requests:
-            raise ValueError(f"request already owns KV cache blocks: {request_id}")
-        if not token_ids:
-            raise ValueError("KV cache request must contain at least one token")
-        acquired: list[int] = []
-        parent_hash = b""
-        max_reused_blocks = max(0, (len(token_ids) - 1) // self.config.block_size)
-        if self.config.enable_prefix_caching:
-            for block_index in range(max_reused_blocks):
-                start = block_index * self.config.block_size
-                block_tokens = token_ids[start : start + self.config.block_size]
-                block_hash = self._hash_block(parent_hash, block_tokens)
-                block_id = self._hash_to_block_id.get(block_hash)
-                if block_id is None:
-                    self._prefix_misses += 1
-                    break
-                block = self.blocks[block_id]
-                if not block.computed or block.token_ids != block_tokens:
-                    self._prefix_misses += 1
-                    break
-                self._acquire(block)
-                acquired.append(block_id)
-                self._prefix_hits += 1
-                parent_hash = block_hash
-
-        matched_tokens = len(acquired) * self.config.block_size
-        needed_blocks = math.ceil(
-            (len(token_ids) - matched_tokens) / self.config.block_size
-        )
-        try:
-            acquired.extend(self._allocate_blocks(needed_blocks))
-        except KVCacheCapacityError:
-            self._release_block_ids(acquired)
-            return False
-        self._requests[request_id] = RequestKVCacheState(
-            request_id,
-            acquired,
-            matched_tokens,
-        )
-        return True
-
-    def prepare_step(
-        self,
-        request_id: str,
-        token_ids: tuple[int, ...],
-        *,
-        is_prefill: bool,
-    ) -> KVCacheMetadata:
-        state = self._state(request_id)
-        if len(token_ids) <= state.num_computed_tokens:
-            raise ValueError("KV cache step has no new token to compute")
-        required_blocks = math.ceil(len(token_ids) / self.config.block_size)
-        additional = required_blocks - len(state.block_ids)
-        if additional > 0:
-            state.block_ids.extend(self._allocate_blocks(additional))
-        query_len = len(token_ids) - state.num_computed_tokens
-        slots = tuple(
-            self._slot(state.block_ids, position)
-            for position in range(state.num_computed_tokens, len(token_ids))
-        )
-        for block_id in state.block_ids:
-            self._touch(self.blocks[block_id])
-        return KVCacheMetadata(
-            request_id=request_id,
-            is_prefill=is_prefill,
-            context_len=len(token_ids),
-            query_len=query_len,
-            block_table=tuple(state.block_ids),
-            slot_mapping=slots,
-        )
-
-    def commit_step(self, request_id: str, token_ids: tuple[int, ...]) -> None:
-        state = self._state(request_id)
-        if len(token_ids) < state.num_computed_tokens:
-            raise ValueError("KV cache computed token count cannot move backwards")
-        parent_hash = b""
-        complete_blocks = len(token_ids) // self.config.block_size
-        for block_index in range(complete_blocks):
-            block_id = state.block_ids[block_index]
-            block = self.blocks[block_id]
-            start = block_index * self.config.block_size
-            block_tokens = token_ids[start : start + self.config.block_size]
+    def get_computed_blocks(self, request: EngineCoreRequest) -> tuple[KVBlock, ...]:
+        """Probe the reusable prefix. Allocation acquires the references."""
+        if not self.enable_prefix_caching:
+            return ()
+        token_ids = request.all_token_ids
+        matched: list[KVBlock] = []
+        parent_hash = ""
+        # Keep at least the last token for the model to produce logits.
+        for start in range(0, len(token_ids) - self.block_size, self.block_size):
+            block_tokens = token_ids[start : start + self.block_size]
             block_hash = self._hash_block(parent_hash, block_tokens)
-            if block.computed:
-                hash_changed = (
-                    self.config.enable_prefix_caching and block.block_hash != block_hash
-                )
-                if hash_changed or block.token_ids != block_tokens:
-                    raise RuntimeError(
-                        "shared KV cache block content changed: "
-                        f"request_id={request_id} block_index={block_index} "
-                        f"block_id={block_id} "
-                        f"hash_match={block.block_hash == block_hash} "
-                        f"tokens_match={block.token_ids == block_tokens}"
-                    )
-            else:
-                block.computed = True
-                block.token_ids = block_tokens
-                if self.config.enable_prefix_caching:
-                    block.block_hash = block_hash
-                    existing = self._hash_to_block_id.get(block_hash)
-                    if existing is None or existing == block_id:
-                        self._hash_to_block_id[block_hash] = block_id
-            self._touch(block)
+            block = self.block_pool.lookup(block_hash)
+            if block is None or block.token_ids != block_tokens:
+                break
+            matched.append(block)
             parent_hash = block_hash
-        state.num_computed_tokens = len(token_ids)
+        return tuple(matched)
 
-    def release(self, request_id: str) -> None:
-        state = self._requests.pop(request_id, None)
-        if state is not None:
-            self._release_block_ids(state.block_ids)
+    def allocate_slots(
+        self,
+        request: EngineCoreRequest,
+        num_new_tokens: int,
+        *,
+        computed_blocks: tuple[KVBlock, ...] = (),
+    ) -> tuple[KVBlock, ...] | None:
+        """Reserve this step's blocks. A capacity miss leaves the pool unchanged."""
+        request_id = request.request_id
+        blocks = self.req_to_blocks.get(request_id)
+        computed_tokens = (
+            request.num_computed_tokens
+            if blocks is not None
+            else len(computed_blocks) * self.block_size
+        )
+        end = computed_tokens + num_new_tokens
+        token_ids = request.all_token_ids
+        if num_new_tokens < 1 or end > min(len(token_ids), self.max_model_len):
+            raise ValueError("KV cache allocation exceeds the request context")
 
-    def num_computed_tokens(self, request_id: str) -> int:
-        return self._state(request_id).num_computed_tokens
+        held_blocks = len(blocks) if blocks is not None else len(computed_blocks)
+        needed = max(0, (end + self.block_size - 1) // self.block_size - held_blocks)
+        idle_hits = sum(block.ref_cnt == 0 for block in computed_blocks)
+        if needed + idle_hits > self.block_pool.free_queue.size:
+            return None
 
-    def block_table(self, request_id: str) -> tuple[int, ...]:
-        return tuple(self._state(request_id).block_ids)
+        if blocks is None:
+            hashes: list[str] = []
+            for block in computed_blocks:
+                block_hash = block.block_hash
+                assert block_hash is not None
+                acquired = self.block_pool.lookup_and_acquire(block_hash)
+                assert acquired is block
+                hashes.append(block_hash)
+            blocks = list(computed_blocks)
+            self.req_to_blocks[request_id] = blocks
+            self.num_cached_blocks[request_id] = len(blocks)
+            request.block_hashes[:] = hashes
+            request.num_computed_tokens = computed_tokens
+            self.prefix_hits += len(blocks)
+            self.prefix_misses += int(
+                self.enable_prefix_caching
+                and len(blocks) < (len(token_ids) - 1) // self.block_size
+            )
+
+        new_blocks = tuple(self.block_pool.allocate() for _ in range(needed))
+        blocks.extend(new_blocks)
+        self.prepared_token_ids[request_id] = token_ids[:end]
+        return new_blocks
+
+    def get_block_ids(self, request_id: str) -> tuple[int, ...]:
+        return tuple(block.block_id for block in self.req_to_blocks[request_id])
+
+    def cache_blocks(
+        self, request: EngineCoreRequest, num_computed_tokens: int
+    ) -> None:
+        """Register full blocks after a successful forward."""
+        request_id = request.request_id
+        blocks = self.req_to_blocks[request_id]
+        token_ids = request.all_token_ids
+        if num_computed_tokens > len(blocks) * self.block_size:
+            raise ValueError("KV cache commit exceeds reserved space")
+        if (
+            num_computed_tokens > len(token_ids)
+            or self.prepared_token_ids.get(request_id)
+            != token_ids[:num_computed_tokens]
+        ):
+            raise ValueError("KV cache commit does not match the prepared step")
+
+        if self.enable_prefix_caching:
+            complete_blocks = num_computed_tokens // self.block_size
+            parent_hash = request.block_hashes[-1] if request.block_hashes else ""
+            for index in range(self.num_cached_blocks[request_id], complete_blocks):
+                block = blocks[index]
+                if block.ref_cnt != 1 or block.block_hash is not None:
+                    raise RuntimeError("cannot cache into a shared KV block")
+                start = index * self.block_size
+                block.token_ids = token_ids[start : start + self.block_size]
+                parent_hash = self._hash_block(parent_hash, block.token_ids)
+                self.block_pool.insert(parent_hash, block)
+                request.block_hashes.append(parent_hash)
+            self.num_cached_blocks[request_id] = complete_blocks
+        del self.prepared_token_ids[request_id]
+
+    def free(self, request_id: str) -> None:
+        blocks = self.req_to_blocks.pop(request_id, ())
+        self.num_cached_blocks.pop(request_id, None)
+        self.prepared_token_ids.pop(request_id, None)
+        # Release the suffix first so eviction retains the longest usable prefix.
+        for block in reversed(blocks):
+            self.block_pool.release(block)
 
     def stats(self) -> KVCacheStats:
-        cached = sum(
-            block.computed and block.block_hash is not None for block in self.blocks
-        )
-        active = sum(block.ref_count > 0 for block in self.blocks)
+        pool = self.block_pool
         return KVCacheStats(
-            total_blocks=self.num_blocks,
-            free_blocks=len(self._free_block_ids),
-            cached_blocks=cached,
-            active_blocks=active,
-            prefix_hits=self._prefix_hits,
-            prefix_misses=self._prefix_misses,
-            evictions=self._evictions,
+            total_blocks=len(pool.blocks),
+            free_blocks=sum(
+                block.ref_cnt == 0 and block.block_hash is None for block in pool.blocks
+            ),
+            cached_blocks=sum(block.block_hash is not None for block in pool.blocks),
+            active_blocks=len(pool.blocks) - pool.free_queue.size,
+            prefix_hits=self.prefix_hits,
+            prefix_misses=self.prefix_misses,
+            evictions=pool.evictions,
         )
 
-    def _allocate_blocks(self, count: int) -> list[int]:
-        allocated: list[int] = []
-        try:
-            for _ in range(count):
-                allocated.append(self._allocate_block())
-        except KVCacheCapacityError:
-            self._release_block_ids(allocated)
-            raise
-        return allocated
-
-    def _allocate_block(self) -> int:
-        if not self._free_block_ids:
-            self._evict_one()
-        if not self._free_block_ids:
-            raise KVCacheCapacityError("KV cache has no evictable block")
-        block_id = self._free_block_ids.popleft()
-        block = self.blocks[block_id]
-        if block.ref_count or block.computed or block.block_hash is not None:
-            raise RuntimeError("free KV cache block is not reset")
-        block.ref_count = 1
-        self._touch(block)
-        return block_id
-
-    def _evict_one(self) -> None:
-        candidates = [
-            block
-            for block in self.blocks
-            if block.ref_count == 0 and block.block_hash is not None
-        ]
-        if not candidates:
-            return
-        victim = min(candidates, key=lambda block: block.last_access)
-        self._reset_block(victim)
-        self._evictions += 1
-
-    def _release_block_ids(self, block_ids: list[int]) -> None:
-        for block_id in block_ids:
-            block = self.blocks[block_id]
-            if block.ref_count < 1:
-                raise RuntimeError("KV cache block ref_count underflow")
-            block.ref_count -= 1
-            self._touch(block)
-            if block.ref_count == 0 and block.block_hash is None:
-                self._reset_block(block)
-
-    def _reset_block(self, block: KVCacheBlock) -> None:
-        if block.ref_count:
-            raise RuntimeError("cannot reset referenced KV cache block")
-        if (
-            block.block_hash is not None
-            and self._hash_to_block_id.get(block.block_hash) == block.block_id
-        ):
-            del self._hash_to_block_id[block.block_hash]
-        block.block_hash = None
-        block.token_ids = ()
-        block.computed = False
-        block.last_access = 0
-        self._free_block_ids.append(block.block_id)
-
-    def _acquire(self, block: KVCacheBlock) -> None:
-        block.ref_count += 1
-        self._touch(block)
-
-    def _touch(self, block: KVCacheBlock) -> None:
-        self._clock += 1
-        block.last_access = self._clock
-
-    def _slot(self, block_ids: list[int], position: int) -> int:
-        logical_block = position // self.config.block_size
-        offset = position % self.config.block_size
-        return block_ids[logical_block] * self.config.block_size + offset
-
-    def _hash_block(self, parent_hash: bytes, token_ids: tuple[int, ...]) -> bytes:
+    def _hash_block(self, parent_hash: str, token_ids: tuple[int, ...]) -> str:
         digest = hashlib.blake2b(digest_size=16)
         digest.update(self.model_fingerprint)
-        digest.update(parent_hash)
-        for token_id in token_ids:
-            digest.update(int(token_id).to_bytes(8, "little", signed=True))
-        return digest.digest()
-
-    def _state(self, request_id: str) -> RequestKVCacheState:
-        try:
-            return self._requests[request_id]
-        except KeyError as error:
-            raise KeyError(f"request has no KV cache state: {request_id}") from error
+        digest.update(bytes.fromhex(parent_hash))
+        digest.update(self.pack_tokens.pack(*token_ids))
+        return digest.hexdigest()

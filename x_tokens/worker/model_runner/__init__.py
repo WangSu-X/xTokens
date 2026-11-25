@@ -1,13 +1,14 @@
 """Rank-local model runners."""
 
-from .base import (
+from .gpu_model_runner import GPUModelRunner, GPUModelRunnerFactory
+from .protocol import (
     ModelRunner,
     ModelRunnerFactory,
     ModelRunnerInput,
     ModelRunnerOutput,
+    ModelRunnerRequest,
     SamplingMetadata,
 )
-from .gpu_model_runner import GPUModelRunner, GPUModelRunnerFactory
 
 __all__ = [
     "GPUModelRunner",
@@ -16,5 +17,6 @@ __all__ = [
     "ModelRunnerFactory",
     "ModelRunnerInput",
     "ModelRunnerOutput",
+    "ModelRunnerRequest",
     "SamplingMetadata",
 ]

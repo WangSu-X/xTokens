@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from x_tokens.engine.core_client import EngineCoreClient
 from x_tokens.engine.protocol import (
     CoreErrorEvent,
-    CoreEvent,
     CoreFinishedEvent,
+    CoreRequestOutput,
     CoreTokenEvent,
+    EngineCoreClient,
     EngineHealth,
     FinishReason,
     GenerateRequest,
@@ -25,63 +25,63 @@ class FakeEngineConfig:
 class FakeEngineCore:
     def __init__(self, config: FakeEngineConfig | None = None) -> None:
         self.config = config or FakeEngineConfig()
-        self._requests: dict[str, int] = {}
-        self._closed = False
+        self.requests: dict[str, int] = {}
+        self.closed = False
 
     def add_request(self, request: GenerateRequest) -> None:
-        self._requests[request.request_id] = 0
+        self.requests[request.request_id] = 0
 
-    def step_fn(self) -> tuple[tuple[CoreEvent, ...], bool]:
-        events: list[CoreEvent] = []
-        for request_id, step in tuple(self._requests.items()):
+    def step_fn(self) -> tuple[tuple[CoreRequestOutput, ...], bool]:
+        request_outputs: list[CoreRequestOutput] = []
+        for request_id, step in tuple(self.requests.items()):
             if request_id == self.config.error_on_request_id:
-                events.append(CoreErrorEvent(request_id, "fake core error"))
-                del self._requests[request_id]
+                request_outputs.append(CoreErrorEvent(request_id, "fake core error"))
+                del self.requests[request_id]
             elif step == 0:
-                events.append(CoreTokenEvent(request_id, 1))
-                self._requests[request_id] = 1
+                request_outputs.append(CoreTokenEvent(request_id, 1))
+                self.requests[request_id] = 1
             else:
-                events.append(
+                request_outputs.append(
                     CoreFinishedEvent(request_id, FinishReason.LENGTH, 1, step)
                 )
-                del self._requests[request_id]
-        return tuple(events), bool(events)
+                del self.requests[request_id]
+        return tuple(request_outputs), bool(request_outputs)
 
     def post_step(self) -> None:
         pass
 
     def abort_requests(self, request_ids: tuple[str, ...]) -> None:
         for request_id in request_ids:
-            self._requests.pop(request_id, None)
+            self.requests.pop(request_id, None)
 
     def health(self) -> EngineHealth:
-        return EngineHealth(not self._closed, "fake core")
+        return EngineHealth(not self.closed, "fake core")
 
     def close(self) -> None:
-        self._closed = True
-        self._requests.clear()
+        self.closed = True
+        self.requests.clear()
 
 
 class FakeCoreClient(EngineCoreClient):
     def __init__(self, core: FakeEngineCore) -> None:
-        self._core = core
+        self.core = core
 
     def add_request(self, request: GenerateRequest) -> None:
-        self._core.add_request(request)
+        self.core.add_request(request)
 
-    async def get_output(self) -> tuple[CoreEvent, ...]:
-        events, _ = self._core.step_fn()
-        self._core.post_step()
-        return events
+    async def get_output(self) -> tuple[CoreRequestOutput, ...]:
+        request_outputs, _ = self.core.step_fn()
+        self.core.post_step()
+        return request_outputs
 
     def abort_requests(self, request_ids: tuple[str, ...]) -> None:
-        self._core.abort_requests(request_ids)
+        self.core.abort_requests(request_ids)
 
     def health(self) -> EngineHealth:
-        return self._core.health()
+        return self.core.health()
 
     def close(self) -> None:
-        self._core.close()
+        self.core.close()
 
 
 class FakeInputProcessor(InputProcessor):

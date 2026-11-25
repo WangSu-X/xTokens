@@ -27,14 +27,36 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model", required=True)
     parser.add_argument("--served-model-name")
-    parser.add_argument("--engine", choices=("inproc",), default="inproc")
+    parser.add_argument(
+        "--engine",
+        choices=("inproc", "multiproc"),
+        default="multiproc",
+        help="EngineCore client transport (default: %(default)s)",
+    )
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--max-num-seqs", type=int, default=4)
+    parser.add_argument(
+        "--max-prefill-batch-tokens",
+        type=int,
+        help="Set the token budget for uncached prefill work",
+    )
+    parser.add_argument("--enable-chunked-prefill", action="store_true")
+    parser.add_argument(
+        "--prefill-chunk-alignment",
+        type=int,
+        help="Token alignment for intermediate chunks when several prefills compete",
+    )
     parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--kv-cache-block-size", type=int, default=16)
+    parser.add_argument(
+        "--kv-cache-block-size", type=int, help="KV block size (default: 16)"
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    parser.add_argument("--num-gpu-blocks", type=int)
+    cache_budget = parser.add_mutually_exclusive_group()
+    cache_budget.add_argument("--num-gpu-blocks", type=int)
+    cache_budget.add_argument(
+        "--kv-cache-memory-bytes", type=int, help="KV cache byte budget per rank"
+    )
     parser.add_argument("--disable-prefix-caching", action="store_true")
     parser.add_argument(
         "--distributed-executor-backend", choices=("uni", "mp"), default="uni"
@@ -75,16 +97,24 @@ def main(argv: list[str] | None = None) -> None:
             model=args.model,
             max_model_len=args.max_model_len,
         ),
-        scheduler_config=SchedulerConfig(max_num_seqs=args.max_num_seqs),
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=args.max_num_seqs,
+            max_prefill_batch_tokens=args.max_prefill_batch_tokens,
+            enable_chunked_prefill=args.enable_chunked_prefill,
+            prefill_chunk_alignment=args.prefill_chunk_alignment,
+        ),
         executor_config=ExecutorConfig(
             dtype=args.dtype,
             local_files_only=args.local_files_only,
         ),
         kv_cache_config=KVCacheConfig(
-            block_size=args.kv_cache_block_size,
+            block_size=args.kv_cache_block_size
+            if args.kv_cache_block_size is not None
+            else KVCacheConfig().block_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
             num_gpu_blocks=args.num_gpu_blocks,
             enable_prefix_caching=not args.disable_prefix_caching,
+            memory_bytes=args.kv_cache_memory_bytes,
         ),
         parallel_config=ParallelConfig(
             distributed_executor_backend=args.distributed_executor_backend,
@@ -106,6 +136,7 @@ def main(argv: list[str] | None = None) -> None:
             shutdown_policy=args.shutdown_policy,
             cors_origins=tuple(args.cors_origin),
             access_log=not args.no_access_log,
+            core_client_mode="in_proc" if args.engine == "inproc" else "multi_proc",
         ),
     )
     uvicorn.run(

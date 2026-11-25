@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from x_tokens.kv_cache import KVCacheMetadata, KVCacheSpec
+from x_tokens.kv_cache import KVCacheSlots, KVCacheSpec
 from x_tokens.worker import GPUKVCache
 
 
@@ -14,12 +14,9 @@ def test_gpu_kv_cache_writes_slots_and_gathers_logical_block_order() -> None:
         dtype=torch.float32,
     )
     metadata = (
-        KVCacheMetadata(
-            "request",
-            True,
+        KVCacheSlots(
             context_len=3,
-            query_len=3,
-            block_table=(2, 0),
+            block_ids=(2, 0),
             slot_mapping=(4, 5, 0),
         ),
     )

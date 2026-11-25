@@ -7,7 +7,6 @@ from typing import Protocol
 
 from x_tokens.config import KVCacheConfig
 from x_tokens.distributed import ParallelContext
-from x_tokens.kv_cache import KVCacheMetadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,11 +17,17 @@ class SamplingMetadata:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelRunnerRequest:
+    token_ids: tuple[int, ...]
+    num_computed_tokens: int
+    block_ids: tuple[int, ...]
+    sampling_metadata: SamplingMetadata | None
+
+
+@dataclass(frozen=True, slots=True)
 class ModelRunnerInput:
     step_id: int
-    token_ids: tuple[tuple[int, ...], ...]
-    sampling_metadata: tuple[SamplingMetadata, ...]
-    kv_cache_metadata: tuple[KVCacheMetadata, ...]
+    requests: tuple[ModelRunnerRequest, ...]
 
 
 @dataclass(frozen=True, slots=True)

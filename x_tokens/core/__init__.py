@@ -1,27 +1,22 @@
-"""Backend-independent Core scheduling loop and command protocol."""
+"""Backend-independent Core scheduling loop and request protocol."""
 
+from ..engine.protocol import EngineCoreRequest, RequestStatus
 from .config import EngineCoreConfig
 from .engine_core import EngineCore, EngineCoreOutputs
 from .kv_cache_manager import KVCacheCapacityError, KVCacheManager
-from .scheduler import (
-    RequestStatus,
-    ScheduledRequest,
-    Scheduler,
-    SchedulerOutput,
-    SchedulerPhase,
-    SchedulerUpdate,
-)
+from .protocol import SchedulerOutput, SchedulerRequest, SchedulerUpdate
+from .scheduler import Scheduler
 
 __all__ = [
     "EngineCore",
     "EngineCoreConfig",
     "EngineCoreOutputs",
+    "EngineCoreRequest",
     "KVCacheCapacityError",
     "KVCacheManager",
     "RequestStatus",
-    "ScheduledRequest",
     "Scheduler",
     "SchedulerOutput",
-    "SchedulerPhase",
+    "SchedulerRequest",
     "SchedulerUpdate",
 ]

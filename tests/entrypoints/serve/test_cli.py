@@ -84,6 +84,28 @@ def test_cli_defaults_served_model_name_to_model(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
+    ("engine_args", "expected_mode"),
+    [
+        ([], "multi_proc"),
+        (["--engine", "multiproc"], "multi_proc"),
+        (["--engine", "inproc"], "in_proc"),
+    ],
+)
+def test_cli_selects_engine_core_transport(
+    monkeypatch, engine_args, expected_mode
+) -> None:
+    invocation: dict[str, Any] = {}
+    monkeypatch.setattr(
+        cli, "create_app", lambda config: invocation.update(config=config)
+    )
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
+
+    cli.main(["--model", "test-model", *engine_args])
+
+    assert invocation["config"].server_config.core_client_mode == expected_mode
+
+
+@pytest.mark.parametrize(
     "option",
     [
         "--hf-model",
@@ -98,4 +120,48 @@ def test_cli_rejects_removed_executor_options(option: str) -> None:
     with pytest.raises(SystemExit) as error:
         cli.main(["--model", "test-model", option])
 
+    assert error.value.code == 2
+
+
+def test_cli_configures_native_chunked_prefill(monkeypatch) -> None:
+    invocation: dict[str, Any] = {}
+    monkeypatch.setattr(
+        cli, "create_app", lambda config: invocation.update(config=config)
+    )
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
+
+    cli.main(
+        [
+            "--model",
+            "test-model",
+            "--kv-cache-memory-bytes",
+            "1024",
+            "--enable-chunked-prefill",
+            "--max-prefill-batch-tokens",
+            "4096",
+            "--prefill-chunk-alignment",
+            "768",
+        ]
+    )
+
+    config = invocation["config"]
+    assert config.scheduler_config.max_prefill_batch_tokens == 4096
+    assert config.scheduler_config.enable_chunked_prefill
+    assert config.scheduler_config.prefill_chunk_alignment == 768
+    assert config.kv_cache_config.block_size == 16
+    assert config.kv_cache_config.memory_bytes == 1024
+
+
+def test_cli_rejects_two_kv_cache_budgets() -> None:
+    with pytest.raises(SystemExit) as error:
+        cli.main(
+            [
+                "--model",
+                "test-model",
+                "--num-gpu-blocks",
+                "3",
+                "--kv-cache-memory-bytes",
+                "1024",
+            ]
+        )
     assert error.value.code == 2

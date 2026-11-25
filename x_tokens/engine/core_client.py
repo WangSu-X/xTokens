@@ -1,4 +1,4 @@
-"""EngineCore client contract, factory, and transport implementations."""
+"""In-process and multiprocess EngineCore client transports."""
 
 from __future__ import annotations
 
@@ -6,59 +6,23 @@ import asyncio
 import json
 import multiprocessing
 import tempfile
-import threading
 import uuid
-from abc import ABC, abstractmethod
+from array import array
 from pathlib import Path
 from typing import Any
 
 from x_tokens.config import XTokensConfig
 from x_tokens.engine.protocol import (
-    CoreEvent,
+    CoreRequestOutput,
+    EngineCoreClient,
+    EngineCoreRequest,
+    EngineCoreRequestType,
     EngineHealth,
     GenerateRequest,
     decode_core_event,
     encode_core_request,
 )
-from x_tokens.executor.base import ExecutorFactory
-
-
-class EngineCoreClient(ABC):
-    """Transport boundary used by LLMEngine to drive EngineCore."""
-
-    @staticmethod
-    def make_client(
-        config: XTokensConfig,
-        *,
-        pad_token_id: int,
-        eos_token_ids: frozenset[int],
-        executor_factory: ExecutorFactory,
-    ) -> EngineCoreClient:
-        mode = config.server_config.core_client_mode
-        if mode == "in_proc":
-            return InProcessClient(
-                config, pad_token_id, eos_token_ids, executor_factory
-            )
-        if mode == "multi_proc":
-            return MultiProcessClient(
-                config, pad_token_id, eos_token_ids, executor_factory
-            )
-        raise ValueError(f"unsupported EngineCore client mode: {mode}")
-
-    @abstractmethod
-    def add_request(self, request: GenerateRequest) -> None: ...
-
-    @abstractmethod
-    async def get_output(self) -> tuple[CoreEvent, ...]: ...
-
-    @abstractmethod
-    def abort_requests(self, request_ids: tuple[str, ...]) -> None: ...
-
-    @abstractmethod
-    def health(self) -> EngineHealth: ...
-
-    @abstractmethod
-    def close(self) -> None: ...
+from x_tokens.executor.protocol import ExecutorFactory
 
 
 class InProcessClient(EngineCoreClient):
@@ -69,19 +33,31 @@ class InProcessClient(EngineCoreClient):
         config: XTokensConfig,
         pad_token_id: int,
         eos_token_ids: frozenset[int],
-        executor_factory: ExecutorFactory,
+        executor_factory: ExecutorFactory | None = None,
     ) -> None:
-        from x_tokens.core.engine_core import EngineCore
+        from x_tokens.core import EngineCore, EngineCoreConfig
 
-        self.engine_core = EngineCore.from_config(
-            config, pad_token_id, eos_token_ids, executor_factory
+        self.engine_core = EngineCore(
+            EngineCoreConfig(config, pad_token_id, eos_token_ids),
+            executor_factory=executor_factory,
         )
         self.closed = False
 
     def add_request(self, request: GenerateRequest) -> None:
-        self.engine_core.add_request(request)
+        try:
+            core_request = EngineCoreRequest.from_input(
+                request.request_id,
+                request.sampling,
+                request.prompt,
+                model=request.model,
+                served_model_name=self.engine_core.config.served_model_name,
+            )
+        except (TypeError, ValueError) as error:
+            self.engine_core.reject_request(request.request_id, str(error))
+            return
+        self.engine_core.add_request(core_request)
 
-    async def get_output(self) -> tuple[CoreEvent, ...]:
+    async def get_output(self) -> tuple[CoreRequestOutput, ...]:
         if self.closed:
             return ()
         outputs, model_executed = self.engine_core.step_fn()
@@ -106,19 +82,20 @@ class InProcessClient(EngineCoreClient):
 
 
 class MultiProcessClient(EngineCoreClient):
-    """Submit commands and asynchronously receive outputs from EngineCore."""
+    """Submit requests and asynchronously receive outputs from EngineCore."""
 
     def __init__(
         self,
         config: XTokensConfig,
         pad_token_id: int,
         eos_token_ids: frozenset[int],
-        executor_factory: ExecutorFactory,
+        executor_factory: ExecutorFactory | None = None,
     ) -> None:
-        from x_tokens.core.engine_core import EngineCore
+        from x_tokens.core import EngineCore, EngineCoreConfig
 
         try:
             import zmq
+            import zmq.asyncio
         except ImportError as error:
             raise RuntimeError(
                 "MultiProcessClient requires pyzmq; install the project dependencies"
@@ -126,40 +103,30 @@ class MultiProcessClient(EngineCoreClient):
 
         self.zmq = zmq
         self.temp_dir = tempfile.TemporaryDirectory(prefix="xtokens-core-")
-        command_endpoint = f"ipc://{Path(self.temp_dir.name) / 'commands.sock'}"
+        input_endpoint = f"ipc://{Path(self.temp_dir.name) / 'inputs.sock'}"
         output_endpoint = f"ipc://{Path(self.temp_dir.name) / 'outputs.sock'}"
         self.client_identity = uuid.uuid4().hex.encode()
         self.context = zmq.Context()
-        self.command_socket = self.context.socket(zmq.ROUTER)
-        self.command_socket.setsockopt(zmq.LINGER, 0)
-        self.command_socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
+        self.output_context = zmq.asyncio.Context()
+        self.input_socket = self.context.socket(zmq.ROUTER)
+        self.output_socket = self.output_context.socket(zmq.PULL)
+        self.output_socket.setsockopt(zmq.LINGER, 0)
+        self.input_socket.setsockopt(zmq.LINGER, 0)
+        self.input_socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
         timeout_s = config.server_config.request_timeout_s or 600.0
         timeout_ms = int(timeout_s * 1000)
-        self.command_socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        self.command_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        self.command_socket.bind(command_endpoint)
+        self.input_socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        self.input_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
         self.closed = False
         self.transport_closed = False
         self.process: multiprocessing.Process | None = None
-        self.process_started = threading.Event()
-        self.receiver_stop = threading.Event()
-        self.receiver_ready = threading.Event()
-        self.output_queue: asyncio.Queue[
-            tuple[CoreEvent, ...] | BaseException
-        ] = asyncio.Queue()
-        self.output_lock = threading.Lock()
         self.output_loop: asyncio.AbstractEventLoop | None = None
-        self.pending_outputs: list[tuple[CoreEvent, ...] | BaseException] = []
-        self.output_thread = threading.Thread(
-            target=self._receive_outputs,
-            args=(output_endpoint,),
-            name="xtokens-engine-core-output",
-            daemon=True,
-        )
-        self.output_thread.start()
-        if not self.receiver_ready.wait(timeout=5):
+        try:
+            self.input_socket.bind(input_endpoint)
+            self.output_socket.bind(output_endpoint)
+        except BaseException:
             self._cleanup_transport()
-            raise TimeoutError("EngineCore output receiver failed to initialize")
+            raise
 
         context = multiprocessing.get_context("spawn")
         parent, child = context.Pipe(duplex=False)
@@ -167,12 +134,10 @@ class MultiProcessClient(EngineCoreClient):
             target=EngineCore.run_process,
             args=(
                 child,
-                command_endpoint,
+                input_endpoint,
                 self.client_identity,
                 output_endpoint,
-                config,
-                pad_token_id,
-                eos_token_ids,
+                EngineCoreConfig(config, pad_token_id, eos_token_ids),
                 executor_factory,
             ),
             name=f"xtokens-engine-core-{uuid.uuid4().hex[:8]}",
@@ -184,7 +149,6 @@ class MultiProcessClient(EngineCoreClient):
             child.close()
             self._cleanup_transport()
             raise
-        self.process_started.set()
         child.close()
         startup_timeout_s = max(timeout_s, config.parallel_config.timeout_s)
         if not parent.poll(startup_timeout_s):
@@ -202,51 +166,77 @@ class MultiProcessClient(EngineCoreClient):
             self._terminate_process()
             raise RuntimeError(f"EngineCore process startup failed:\n{detail}")
         try:
-            identity, handshake = self.command_socket.recv_multipart()
+            identity, handshake = self.input_socket.recv_multipart()
         except self.zmq.error.Again as error:
             self._terminate_process()
-            raise TimeoutError("EngineCore command channel startup timed out") from error
+            raise TimeoutError("EngineCore input channel startup timed out") from error
         if identity != self.client_identity or handshake != b"READY":
             self._terminate_process()
-            raise RuntimeError("EngineCore command channel handshake failed")
+            raise RuntimeError("EngineCore input channel handshake failed")
         self.closed = False
 
-    def _send_command(self, command: str, **payload: Any) -> None:
+    def _send_request(
+        self,
+        request_type: EngineCoreRequestType,
+        *,
+        token_frame: bytes | None = None,
+        **request_fields: Any,
+    ) -> None:
         if self.closed:
             raise RuntimeError("MultiProcessClient is closed")
         if self.process is None or not self.process.is_alive():
             raise RuntimeError("EngineCore process is not running")
         try:
-            self.command_socket.send_multipart(
-                (
-                    self.client_identity,
-                    json.dumps({"command": command, **payload}).encode(),
-                )
-            )
+            frames = [
+                self.client_identity,
+                json.dumps(
+                    {"request_type": request_type.value, **request_fields}
+                ).encode(),
+            ]
+            if token_frame is not None:
+                frames.append(token_frame)
+            self.input_socket.send_multipart(frames)
         except self.zmq.error.Again as error:
             self.closed = True
             self._terminate_process()
             raise TimeoutError(
-                f"timed out sending {command} to EngineCore process"
+                f"timed out sending {request_type} to EngineCore process"
             ) from error
 
     def add_request(self, request: GenerateRequest) -> None:
-        self._send_command("add_request", request=encode_core_request(request))
+        # Endpoints are local IPC peers, so native signed int64 frames share a byte order.
+        tokens = (
+            array("q", request.prompt).tobytes()
+            if isinstance(request.prompt, tuple)
+            else None
+        )
+        self._send_request(
+            EngineCoreRequestType.ADD,
+            request=encode_core_request(request, include_prompt=tokens is None),
+            token_frame=tokens,
+        )
 
-    async def get_output(self) -> tuple[CoreEvent, ...]:
+    async def get_output(self) -> tuple[CoreRequestOutput, ...]:
         loop = asyncio.get_running_loop()
-        with self.output_lock:
-            if self.output_loop is None:
-                self.output_loop = loop
-                for output in self.pending_outputs:
-                    self.output_queue.put_nowait(output)
-                self.pending_outputs.clear()
-            elif self.output_loop is not loop:
-                raise RuntimeError("MultiProcessClient cannot span event loops")
-        output = await self.output_queue.get()
-        if isinstance(output, BaseException):
-            raise output
-        return output
+        if self.output_loop is None:
+            self.output_loop = loop
+        elif self.output_loop is not loop:
+            raise RuntimeError("MultiProcessClient cannot span event loops")
+        while not self.closed:
+            if not await self.output_socket.poll(timeout=100):
+                if self.process is None or not self.process.is_alive():
+                    raise RuntimeError("EngineCore process exited unexpectedly")
+                continue
+            output_message = json.loads(
+                await self.output_socket.recv(flags=self.zmq.DONTWAIT)
+            )
+            if "error" in output_message:
+                raise RuntimeError(output_message["error"])
+            return tuple(
+                decode_core_event(encoded_output)
+                for encoded_output in output_message["events"]
+            )
+        raise RuntimeError("MultiProcessClient is closed")
 
     def abort_requests(self, request_ids: tuple[str, ...]) -> None:
         if (
@@ -255,7 +245,9 @@ class MultiProcessClient(EngineCoreClient):
             and self.process is not None
             and self.process.is_alive()
         ):
-            self._send_command("abort_requests", request_ids=list(request_ids))
+            self._send_request(
+                EngineCoreRequestType.ABORT, request_ids=list(request_ids)
+            )
 
     def health(self) -> EngineHealth:
         ready = not self.closed and self.process is not None and self.process.is_alive()
@@ -271,7 +263,7 @@ class MultiProcessClient(EngineCoreClient):
             return
         try:
             if self.process is not None and self.process.is_alive():
-                self._send_command("close")
+                self._send_request(EngineCoreRequestType.CLOSE)
         finally:
             self.closed = True
             if self.process is not None:
@@ -290,59 +282,8 @@ class MultiProcessClient(EngineCoreClient):
         if self.transport_closed:
             return
         self.transport_closed = True
-        self.receiver_stop.set()
-        self.command_socket.close(0)
+        self.input_socket.close(0)
+        self.output_socket.close(0)
         self.context.term()
-        if self.output_thread.is_alive():
-            self.output_thread.join(timeout=1)
+        self.output_context.term()
         self.temp_dir.cleanup()
-
-    def _publish_output(self, output: tuple[CoreEvent, ...] | BaseException) -> None:
-        with self.output_lock:
-            loop = self.output_loop
-            if loop is None:
-                self.pending_outputs.append(output)
-                return
-        try:
-            loop.call_soon_threadsafe(self.output_queue.put_nowait, output)
-        except RuntimeError:
-            pass
-
-    def _receive_outputs(self, endpoint: str) -> None:
-        import zmq as zmq_module
-
-        context = zmq_module.Context()
-        socket = context.socket(zmq_module.PULL)
-        socket.setsockopt(zmq_module.LINGER, 0)
-        try:
-            socket.bind(endpoint)
-            self.receiver_ready.set()
-            poller = zmq_module.Poller()
-            poller.register(socket, zmq_module.POLLIN)
-            while not self.receiver_stop.is_set():
-                if poller.poll(100):
-                    message = socket.recv_json()
-                    if "error" in message:
-                        self._publish_output(RuntimeError(message["error"]))
-                    else:
-                        events = tuple(
-                            decode_core_event(event) for event in message["events"]
-                        )
-                        if events:
-                            self._publish_output(events)
-                if (
-                    not self.closed
-                    and self.process_started.is_set()
-                    and self.process is not None
-                    and not self.process.is_alive()
-                ):
-                    self._publish_output(
-                        RuntimeError("EngineCore process exited unexpectedly")
-                    )
-                    return
-        except Exception as error:  # noqa: BLE001 - forwarded to async consumers.
-            self.receiver_ready.set()
-            self._publish_output(error)
-        finally:
-            socket.close(0)
-            context.term()

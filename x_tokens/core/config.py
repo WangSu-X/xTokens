@@ -1,45 +1,20 @@
-"""Backend-independent configuration for an EngineCore."""
+"""Startup configuration for an EngineCore."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
-from x_tokens.config import KVCacheConfig, XTokensConfig
+from x_tokens.config import XTokensConfig
 
 
 @dataclass(frozen=True, slots=True)
 class EngineCoreConfig:
-    """Scheduling and model-routing settings owned by EngineCore."""
+    """Runtime settings and tokenizer IDs for building an EngineCore."""
 
-    model_aliases: tuple[str, ...]
-    kv_cache_config: KVCacheConfig
-    max_model_len: int = 4096
-    max_num_seqs: int = 4
+    xtokens_config: XTokensConfig
+    pad_token_id: int
+    eos_token_ids: frozenset[int]
 
-    def __post_init__(self) -> None:
-        if not self.model_aliases:
-            raise ValueError("model_aliases must not be empty")
-        if self.kv_cache_config.num_gpu_blocks is None:
-            raise ValueError("EngineCore requires resolved num_gpu_blocks")
-        if self.max_model_len < 2:
-            raise ValueError("max_model_len must be at least 2")
-        if self.max_num_seqs < 1:
-            raise ValueError("max_num_seqs must be positive")
-
-    def accepts_model(self, model: str) -> bool:
-        return model in self.model_aliases
-
-    @classmethod
-    def from_config(
-        cls, config: XTokensConfig, num_gpu_blocks: int
-    ) -> EngineCoreConfig:
-        if num_gpu_blocks < 1:
-            raise RuntimeError("executor did not initialize KV cache")
-        return cls(
-            model_aliases=(config.model_config.served_model_name,),
-            kv_cache_config=replace(
-                config.kv_cache_config, num_gpu_blocks=num_gpu_blocks
-            ),
-            max_model_len=config.model_config.max_model_len,
-            max_num_seqs=config.scheduler_config.max_num_seqs,
-        )
+    @property
+    def served_model_name(self) -> str:
+        return self.xtokens_config.model_config.served_model_name

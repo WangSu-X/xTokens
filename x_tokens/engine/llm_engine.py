@@ -6,16 +6,16 @@ import asyncio
 from collections.abc import AsyncIterator
 
 from x_tokens.config import XTokensConfig
-from x_tokens.executor.base import ExecutorFactory
+from x_tokens.executor.protocol import ExecutorFactory
 
-from .core_client import EngineCoreClient
 from .input_processor import TokenizerInputProcessor
 from .output_processor import TokenizerOutputProcessor
 from .protocol import (
     CoreErrorEvent,
-    CoreEvent,
     CoreFinishedEvent,
+    CoreRequestOutput,
     CoreTokenEvent,
+    EngineCoreClient,
     EngineEvent,
     EngineHealth,
     ErrorEvent,
@@ -52,12 +52,6 @@ class LLMEngine(LLMEngineProtocol):
         if core_client is None:
             if config is None:
                 raise ValueError("config is required to construct an EngineCoreClient")
-            if executor_factory is None:
-                from x_tokens.executor.custom_factory import (
-                    create_registered_model_executor,
-                )
-
-                executor_factory = create_registered_model_executor
             core_client = EngineCoreClient.make_client(
                 config,
                 pad_token_id=input_processor.pad_token_id,
@@ -68,7 +62,9 @@ class LLMEngine(LLMEngineProtocol):
         self.input_processor = input_processor
         self.output_processor = output_processor
         self.running_request_ids: set[str] = set()
-        self.request_outputs: dict[str, asyncio.Queue[CoreEvent | BaseException]] = {}
+        self.request_output_queues: dict[
+            str, asyncio.Queue[CoreRequestOutput | BaseException]
+        ] = {}
         self.output_task: asyncio.Task[None] | None = None
         self.closed = False
 
@@ -76,8 +72,10 @@ class LLMEngine(LLMEngineProtocol):
         if request.request_id in self.running_request_ids:
             raise ValueError(f"request_id is already active: {request.request_id}")
         self.running_request_ids.add(request.request_id)
-        request_outputs: asyncio.Queue[CoreEvent | BaseException] = asyncio.Queue()
-        self.request_outputs[request.request_id] = request_outputs
+        request_output_queue: asyncio.Queue[CoreRequestOutput | BaseException] = (
+            asyncio.Queue()
+        )
+        self.request_output_queues[request.request_id] = request_output_queue
         done = False
         try:
             processed_request = await asyncio.to_thread(
@@ -86,18 +84,18 @@ class LLMEngine(LLMEngineProtocol):
             self.core_client.add_request(processed_request)
             self._ensure_output_task()
             while True:
-                req_output = await request_outputs.get()
-                if isinstance(req_output, BaseException):
-                    raise req_output
-                done = isinstance(req_output, (CoreErrorEvent, CoreFinishedEvent))
-                yield self.parse_output(req_output)
+                request_output = await request_output_queue.get()
+                if isinstance(request_output, BaseException):
+                    raise request_output
+                done = isinstance(request_output, (CoreErrorEvent, CoreFinishedEvent))
+                yield self.parse_output(request_output)
                 if done:
                     break
         finally:
             if not done and not self.closed:
                 self.core_client.abort_requests((request.request_id,))
             self.running_request_ids.discard(request.request_id)
-            self.request_outputs.pop(request.request_id, None)
+            self.request_output_queues.pop(request.request_id, None)
             self.output_processor.finish(request.request_id)
             await self._stop_output_task()
 
@@ -108,12 +106,14 @@ class LLMEngine(LLMEngineProtocol):
     async def _read_core_outputs(self) -> None:
         try:
             while self.running_request_ids and not self.closed:
-                req_outputs = await self.core_client.get_output()
-                for event in req_outputs:
-                    request_outputs = self.request_outputs.get(event.request_id)
-                    if request_outputs is not None:
-                        request_outputs.put_nowait(event)
-                if req_outputs:
+                core_outputs = await self.core_client.get_output()
+                for request_output in core_outputs:
+                    request_output_queue = self.request_output_queues.get(
+                        request_output.request_id
+                    )
+                    if request_output_queue is not None:
+                        request_output_queue.put_nowait(request_output)
+                if core_outputs:
                     await asyncio.sleep(0)
                 else:
                     await asyncio.sleep(0.001)
@@ -121,9 +121,9 @@ class LLMEngine(LLMEngineProtocol):
             raise
         except Exception as error:  # noqa: BLE001 - wake every active request.
             for request_id in tuple(self.running_request_ids):
-                request_outputs = self.request_outputs.get(request_id)
-                if request_outputs is not None:
-                    request_outputs.put_nowait(error)
+                request_output_queue = self.request_output_queues.get(request_id)
+                if request_output_queue is not None:
+                    request_output_queue.put_nowait(error)
 
     async def _stop_output_task(self, *, force: bool = False) -> None:
         if self.output_task is None or (self.running_request_ids and not force):
@@ -133,22 +133,26 @@ class LLMEngine(LLMEngineProtocol):
         output_task.cancel()
         await asyncio.gather(output_task, return_exceptions=True)
 
-    def parse_output(self, event: CoreEvent) -> EngineEvent:
-        if isinstance(event, CoreTokenEvent):
+    def parse_output(self, request_output: CoreRequestOutput) -> EngineEvent:
+        if isinstance(request_output, CoreTokenEvent):
             text = self.output_processor.process_token(
-                event.request_id, event.token_id
+                request_output.request_id, request_output.token_id
             )
-            return TokenEvent(event.request_id, event.token_id, text)
-        if isinstance(event, CoreFinishedEvent):
+            return TokenEvent(request_output.request_id, request_output.token_id, text)
+        if isinstance(request_output, CoreFinishedEvent):
             return FinishedEvent(
-                event.request_id,
-                event.finish_reason,
-                event.prompt_tokens,
-                event.completion_tokens,
+                request_output.request_id,
+                request_output.finish_reason,
+                request_output.prompt_tokens,
+                request_output.completion_tokens,
             )
-        if isinstance(event, CoreErrorEvent):
-            return ErrorEvent(event.request_id, event.message, event.retryable)
-        raise TypeError(f"unsupported Core event: {type(event)!r}")
+        if isinstance(request_output, CoreErrorEvent):
+            return ErrorEvent(
+                request_output.request_id,
+                request_output.message,
+                request_output.retryable,
+            )
+        raise TypeError(f"unsupported Core request output: {type(request_output)!r}")
 
     async def abort(self, request_id: str) -> None:
         self.core_client.abort_requests((request_id,))
@@ -161,7 +165,7 @@ class LLMEngine(LLMEngineProtocol):
             return
         self.closed = True
         self.core_client.abort_requests(tuple(self.running_request_ids))
-        for request_outputs in self.request_outputs.values():
-            request_outputs.put_nowait(RuntimeError("LLMEngine is closed"))
+        for request_output_queue in self.request_output_queues.values():
+            request_output_queue.put_nowait(RuntimeError("LLMEngine is closed"))
         await self._stop_output_task(force=True)
         self.core_client.close()
