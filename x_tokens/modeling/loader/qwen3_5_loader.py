@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -162,7 +161,7 @@ def _copy_parameter(
 
 @torch.no_grad()
 def load_qwen3_5_weights(model: Qwen3_5ForCausalLM) -> WeightLoadReport:
-    root = Path(model.source.path)
+    root = model.load_config.model_path
     manifest = _load_manifest(root)
     prefix = (
         "model.language_model"

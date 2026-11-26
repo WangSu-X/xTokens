@@ -19,6 +19,7 @@ from x_tokens.engine.protocol import (
     FinishReason,
     SamplingParams,
 )
+from x_tokens.executor import ModelExecutor
 from x_tokens.executor.protocol import Executor, ModelForwardOutput
 
 
@@ -61,7 +62,11 @@ def create_core(
         pad_token_id=0,
         eos_token_ids=executor.eos_token_ids,
     )
-    return EngineCore(config, executor_factory=lambda *_: executor)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            ModelExecutor, "get_class", Mock(return_value=Mock(return_value=executor))
+        )
+        return EngineCore(config)
 
 
 def request(

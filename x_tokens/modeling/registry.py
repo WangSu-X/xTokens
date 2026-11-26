@@ -2,26 +2,24 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from x_tokens.config import ParallelConfig
+from x_tokens.distributed import ParallelContext
 
 from .config import ModelLoadConfig
-from .loader.source import ResolvedModelSource
-from .protocol import ConfigAdapter, RunnerFactoryBuilder
-from .qwen3_5_config import Qwen3_5TextConfig
+from .protocol import RunnerFactory
+
+if TYPE_CHECKING:
+    from x_tokens.worker.model_runner.protocol import ModelRunner
 
 
 @dataclass(frozen=True, slots=True)
 class ModelRegistration:
     architecture: str
     model_type: str
-    config_adapter: ConfigAdapter
-    runner_factory_builder: RunnerFactoryBuilder
+    runner_factory: RunnerFactory
 
 
 class ModelRegistry:
@@ -61,42 +59,24 @@ class ModelRegistry:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class ResolvedModelRegistration:
-    source: ResolvedModelSource
-    registration: ModelRegistration
-    config: Qwen3_5TextConfig
-
-
-def resolve_model_registration(
-    source: ResolvedModelSource,
-    parallel_config: ParallelConfig,
-    *,
-    registry: ModelRegistry | None = None,
-) -> ResolvedModelRegistration:
-    with Path(source.config_path).open(encoding="utf-8") as config_file:
-        hf_config = json.load(config_file)
-    if not isinstance(hf_config, dict):
-        raise TypeError("config.json must contain a JSON object")
-    selected_registry = registry or DEFAULT_MODEL_REGISTRY
-    registration = selected_registry.resolve(hf_config)
-    model_config = registration.config_adapter(hf_config)
-    model_config.validate_parallel(parallel_config)
-    return ResolvedModelRegistration(source, registration, model_config)
-
-
 DEFAULT_MODEL_REGISTRY = ModelRegistry()
 
 
-def _create_qwen3_5_runner_factory(
-    source: ResolvedModelSource,
-    model_config: Qwen3_5TextConfig,
+def _create_qwen3_5_runner(
     load_config: ModelLoadConfig,
+    context: ParallelContext,
+    *,
     pad_token_id: int,
-) -> object:
-    from .models.qwen3_5 import Qwen3_5RunnerFactory
+    is_output_rank: bool,
+) -> ModelRunner:
+    from .models.qwen3_5 import create_qwen3_5_runner
 
-    return Qwen3_5RunnerFactory(source, model_config, load_config, pad_token_id)
+    return create_qwen3_5_runner(
+        load_config,
+        context,
+        pad_token_id=pad_token_id,
+        is_output_rank=is_output_rank,
+    )
 
 
 for architecture, model_type in (
@@ -107,7 +87,6 @@ for architecture, model_type in (
         ModelRegistration(
             architecture,
             model_type,
-            Qwen3_5TextConfig.from_hf_config,
-            _create_qwen3_5_runner_factory,
+            _create_qwen3_5_runner,
         )
     )

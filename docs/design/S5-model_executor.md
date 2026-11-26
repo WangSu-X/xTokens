@@ -40,7 +40,7 @@ EngineCore 需要一个执行后端来完成模型前向和采样。直接调用
 ## 非目标
 
 - 不实现管道并行 (PP)、专家并行 (EP) 或数据并行 (DP)；仅 TP
-- 不管理模型权重的磁盘加载和缓存；由 runner_factory 和 GPUWorker 负责
+- GPUWorker 通过模型注册表构造 Runner，再由 Runner 加载权重
 - 不实现异步执行；所有操作都是同步阻塞
 - 不处理模型架构检测；需要用户显式指定模型类型
 
@@ -105,20 +105,21 @@ class ModelExecutor(Executor, ABC):
 #### 1. 初始化
 
 ```python
-executor = ModelExecutor.get_class(parallel_config)(
-    parallel_config=parallel_config,
-    runner_factory=runner_factory,  # 回调，用于创建 ModelRunner
-    eos_token_ids=frozenset([...]),
-    kv_cache_config=kv_cache_config,
+executor_class = ModelExecutor.get_class(config.parallel_config)
+executor = executor_class(
+    config,
+    pad_token_id=pad_token_id,
+    eos_token_ids=eos_token_ids,
 )
 ```
 
 初始化步骤：
-1. 校验 `parallel_config`：仅支持 TP（PP/EP/DP 的 size 必须为 1）
-2. 调用 `_init_executor()`：
+1. Core 调用 `ModelExecutor.get_class()` 根据并行配置选择 Executor 类型，创建的 Executor 校验并行参数并构建拓扑。
+2. Executor 在 `_init_executor()` 中创建 Worker。
    - **UniProcModelExecutor**：直接创建 1 个 GPUWorker，初始化并加载模型
    - **MultiprocModelExecutor**：创建 N 个子进程，每个持有 1 个 GPUWorker
-3. 调用 `_initialize_kv_cache()`：
+3. GPUWorker 初始化设备和并行上下文，解析模型目录，读取一次 `config.json` 并组装 `ModelLoadConfig`。`ModelRegistry.resolve()` 根据同一份配置返回 `ModelRegistration`，登记中的 `runner_factory(load_config, context, pad_token_id=..., is_output_rank=...)` 创建对应的 Runner。权重加载使用 `load_config.model_path`。
+4. Executor 调用 `_initialize_kv_cache()`。
    - 向所有 worker 查询 KV cache 容量
    - 取最小值作为全局 `num_gpu_blocks`
    - 通知 worker 初始化对应大小的块池

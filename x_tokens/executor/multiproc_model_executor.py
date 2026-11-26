@@ -9,7 +9,6 @@ import traceback
 from multiprocessing.connection import Connection
 
 from x_tokens.worker import GPUWorker, GPUWorkerConfig
-from x_tokens.worker.model_runner import ModelRunnerFactory
 
 from .model_executor import ModelExecutor, RunnerGroup
 from .worker_handle import ProcessWorkerHandle
@@ -27,15 +26,16 @@ class MultiprocModelExecutor(ModelExecutor):
             for rank in spec.ranks:
                 parent_connection, child_connection = context.Pipe()
                 worker_config = GPUWorkerConfig(
-                    self.parallel_config,
-                    self.topology,
-                    rank,
-                    init_method,
-                    spec.output_rank,
+                    xtokens_config=self.config,
+                    topology=self.topology,
+                    rank=rank,
+                    distributed_init_method=init_method,
+                    output_rank=spec.output_rank,
+                    pad_token_id=self.pad_token_id,
                 )
                 process = context.Process(
                     target=_worker_entry,
-                    args=(child_connection, worker_config, self.runner_factory),
+                    args=(child_connection, worker_config),
                     name=f"xtokens-worker-{rank}",
                 )
                 process.start()
@@ -80,10 +80,9 @@ class MultiprocModelExecutor(ModelExecutor):
 def _worker_entry(
     connection: Connection,
     config: GPUWorkerConfig,
-    runner_factory: ModelRunnerFactory,
 ) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    worker = GPUWorker(config, runner_factory)
+    worker = GPUWorker(config)
     try:
         worker.init_device()
         worker.load_model()

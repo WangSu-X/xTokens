@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
     from x_tokens.config import XTokensConfig
-    from x_tokens.executor.protocol import ExecutorFactory
 
 
 class FinishReason(StrEnum):
@@ -288,19 +287,14 @@ class EngineCoreClient(ABC):
         *,
         pad_token_id: int,
         eos_token_ids: frozenset[int],
-        executor_factory: ExecutorFactory | None = None,
     ) -> EngineCoreClient:
         from .core_client import InProcessClient, MultiProcessClient
 
         mode = config.server_config.core_client_mode
         if mode == "in_proc":
-            return InProcessClient(
-                config, pad_token_id, eos_token_ids, executor_factory
-            )
+            return InProcessClient(config, pad_token_id, eos_token_ids)
         if mode == "multi_proc":
-            return MultiProcessClient(
-                config, pad_token_id, eos_token_ids, executor_factory
-            )
+            return MultiProcessClient(config, pad_token_id, eos_token_ids)
         raise ValueError(f"unsupported EngineCore client mode: {mode}")
 
     @abstractmethod

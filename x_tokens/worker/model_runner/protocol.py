@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from x_tokens.config import KVCacheConfig
-from x_tokens.distributed import ParallelContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,9 +46,3 @@ class ModelRunner(Protocol):
     def sample_tokens(self, step_id: int) -> tuple[int, ...] | None: ...
 
     def shutdown(self) -> None: ...
-
-
-class ModelRunnerFactory(Protocol):
-    def __call__(
-        self, context: ParallelContext, *, is_output_rank: bool
-    ) -> ModelRunner: ...

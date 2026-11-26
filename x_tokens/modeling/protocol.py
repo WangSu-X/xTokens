@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from x_tokens.distributed import ParallelGroupKind
+from x_tokens.distributed import ParallelContext, ParallelGroupKind
 from x_tokens.kv_cache import KVCacheSlots
 
 from .config import ModelLoadConfig
-from .loader.source import ResolvedModelSource
-from .qwen3_5_config import Qwen3_5TextConfig
+
+if TYPE_CHECKING:
+    from x_tokens.worker.model_runner.protocol import ModelRunner
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,14 +56,12 @@ class XTokensModel(Protocol):
     ) -> ModelOutput: ...
 
 
-ConfigAdapter = Callable[[Mapping[str, Any]], Qwen3_5TextConfig]
-
-
-class RunnerFactoryBuilder(Protocol):
+class RunnerFactory(Protocol):
     def __call__(
         self,
-        source: ResolvedModelSource,
-        model_config: Qwen3_5TextConfig,
         load_config: ModelLoadConfig,
+        context: ParallelContext,
+        *,
         pad_token_id: int,
-    ) -> object: ...
+        is_output_rank: bool,
+    ) -> ModelRunner: ...

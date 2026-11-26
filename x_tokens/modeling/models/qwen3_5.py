@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -22,7 +20,6 @@ from x_tokens.modeling.layers import (
 from x_tokens.modeling.layers.rotary import RotaryEmbedding, rotate_half
 from x_tokens.modeling.loader.qwen3_5_loader import load_qwen3_5_weights
 from x_tokens.modeling.loader.safetensors_loader import WeightLoadReport
-from x_tokens.modeling.loader.source import ResolvedModelSource
 from x_tokens.modeling.protocol import ModelInput, ModelOutput
 from x_tokens.modeling.qwen3_5_config import Qwen3_5TextConfig
 from x_tokens.worker.kv_cache import GPUKVCache
@@ -419,13 +416,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         config: Qwen3_5TextConfig,
         context: ParallelContext,
         dtype: torch.dtype,
-        source: ResolvedModelSource,
         load_config: ModelLoadConfig,
     ) -> None:
         super().__init__()
         self.config = config
         self.context = context
-        self.source = source
         self.load_config = load_config
         self.model = Qwen3_5Model(config, context, dtype)
         self.lm_head = ParallelLMHead(
@@ -488,36 +483,30 @@ class Qwen3_5ForCausalLM(nn.Module):
         return ModelOutput(self.lm_head(hidden))
 
 
-@dataclass(frozen=True, slots=True)
-class Qwen3_5RunnerFactory:
-    source: ResolvedModelSource
-    model_config: Qwen3_5TextConfig
-    load_config: ModelLoadConfig
-    pad_token_id: int
-
-    def __call__(
-        self, context: ParallelContext, *, is_output_rank: bool
-    ) -> GPUModelRunner:
-        dtype_name = (
-            self.model_config.torch_dtype
-            if self.load_config.dtype == "auto"
-            else self.load_config.dtype
-        )
-        dtype = {
-            "float32": torch.float32,
-            "float": torch.float32,
-            "float16": torch.float16,
-            "half": torch.float16,
-            "bfloat16": torch.bfloat16,
-        }.get(dtype_name)
-        if dtype is None:
-            raise ValueError(f"unsupported model dtype: {dtype_name}")
-        model = Qwen3_5ForCausalLM(
-            self.model_config, context, dtype, self.source, self.load_config
-        )
-        return GPUModelRunner(
-            context,
-            model,
-            pad_token_id=self.pad_token_id,
-            is_output_rank=is_output_rank,
-        )
+def create_qwen3_5_runner(
+    load_config: ModelLoadConfig,
+    context: ParallelContext,
+    *,
+    pad_token_id: int,
+    is_output_rank: bool,
+) -> GPUModelRunner:
+    model_config = Qwen3_5TextConfig.from_hf_config(load_config.hf_config)
+    model_config.validate_tensor_parallel(
+        context.group(ParallelGroupKind.TENSOR).world_size
+    )
+    dtype_name = (
+        model_config.torch_dtype if load_config.dtype == "auto" else load_config.dtype
+    )
+    dtype = {
+        "float32": torch.float32,
+        "float": torch.float32,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }.get(dtype_name)
+    if dtype is None:
+        raise ValueError(f"unsupported model dtype: {dtype_name}")
+    model = Qwen3_5ForCausalLM(model_config, context, dtype, load_config)
+    return GPUModelRunner(
+        context, model, pad_token_id=pad_token_id, is_output_rank=is_output_rank
+    )

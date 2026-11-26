@@ -28,7 +28,7 @@ from x_tokens.engine.protocol import (
     decode_core_request,
     encode_core_event,
 )
-from x_tokens.executor.protocol import Executor, ExecutorFactory
+from x_tokens.executor.protocol import Executor
 from x_tokens.logger import init_logger
 
 if TYPE_CHECKING:
@@ -56,23 +56,16 @@ class EngineCoreOutputs:
 class EngineCore:
     """Own scheduler and executor state for synchronous or loop-driven execution."""
 
-    def __init__(
-        self,
-        config: EngineCoreConfig,
-        *,
-        executor_factory: ExecutorFactory | None = None,
-    ) -> None:
+    def __init__(self, config: EngineCoreConfig) -> None:
+        from x_tokens.executor import ModelExecutor
+
         self.config = config
         xtokens_config = config.xtokens_config
-        if executor_factory is None:
-            from x_tokens.executor.custom_factory import (
-                create_registered_model_executor,
-            )
-
-            executor_factory = create_registered_model_executor
-
-        self.executor = executor_factory(
-            xtokens_config, config.pad_token_id, config.eos_token_ids
+        executor_class = ModelExecutor.get_class(xtokens_config.parallel_config)
+        self.executor = executor_class(
+            xtokens_config,
+            pad_token_id=config.pad_token_id,
+            eos_token_ids=config.eos_token_ids,
         )
         try:
             num_gpu_blocks = self.executor.num_gpu_blocks
@@ -112,12 +105,11 @@ class EngineCore:
         client_identity: bytes,
         output_endpoint: str,
         config: EngineCoreConfig,
-        executor_factory: ExecutorFactory | None = None,
     ) -> None:
         """Spawn entry point: construct the executor and Core in the child."""
         with startup_connection:
             try:
-                core = cls(config, executor_factory=executor_factory)
+                core = cls(config)
                 core._serve(
                     startup_connection,
                     input_endpoint,

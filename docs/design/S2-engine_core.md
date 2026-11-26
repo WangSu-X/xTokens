@@ -49,9 +49,9 @@ flowchart LR
     Executor -. implementation .-> Exec["P2: ModelExecutor"]
 ```
 
-`EngineCoreConfig` 保存 `XTokensConfig` 和 tokenizer 提供的 pad/EOS token ID。Core 构造时先通过注册模型工厂创建 Executor，再把实际的 `num_gpu_blocks` 交给 Scheduler。Scheduler 初始化失败时，Core 关闭已创建的 Executor。
+`EngineCoreConfig` 保存 `XTokensConfig` 和 tokenizer 提供的 pad/EOS token ID。Core 通过 `ModelExecutor.get_class()` 按并行配置选择 Executor 类型，创建实例后用实际的 `num_gpu_blocks` 初始化 Scheduler。Scheduler 初始化失败时，Core 关闭已创建的 Executor。
 
-单进程客户端在本进程创建 Core，多进程客户端把配置交给 Core 子进程。可选的 `executor_factory` 用于替换默认工厂。
+单进程客户端在本进程创建 Core，多进程客户端把 `EngineCoreConfig` 交给 Core 子进程。两种模式下，Executor 创建 Worker，Worker 读取模型配置并通过注册表创建 Runner。
 
 ## 详细设计
 

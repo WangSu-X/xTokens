@@ -2,20 +2,25 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import torch
 from safetensors.torch import save_file
 from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
-from x_tokens.config import KVCacheConfig, ParallelConfig
+from x_tokens.config import (
+    ExecutorConfig,
+    KVCacheConfig,
+    ModelConfig,
+    ParallelConfig,
+    XTokensConfig,
+)
 from x_tokens.core.kv_cache_manager import KVCacheManager
 from x_tokens.core.protocol import SchedulerOutput, SchedulerRequest
-from x_tokens.distributed import ParallelTopology, materialize_parallel_context
+from x_tokens.distributed import ParallelTopology
 from x_tokens.engine.protocol import EngineCoreRequest, SamplingParams
-from x_tokens.executor import MultiprocModelExecutor
-from x_tokens.modeling import ModelLoadConfig
-from x_tokens.modeling.loader import resolve_model_source
+from x_tokens.executor import ModelExecutor, MultiprocModelExecutor
 from x_tokens.modeling.loader.qwen3_5_loader import _copy_projection
 from x_tokens.modeling.models.qwen3_5 import (
     Qwen3_5Attention,
@@ -24,8 +29,9 @@ from x_tokens.modeling.models.qwen3_5 import (
     Qwen3_5MLP,
     Qwen3_5Model,
 )
-from x_tokens.modeling.registry import resolve_model_registration
+from x_tokens.worker import GPUWorker, GPUWorkerConfig
 from x_tokens.worker.model_runner import (
+    GPUModelRunner,
     ModelRunnerInput,
     ModelRunnerRequest,
     SamplingMetadata,
@@ -89,19 +95,30 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
     hf_model = tiny_qwen3_5
     save_checkpoint(tmp_path, hf_model, conditional=conditional)
 
-    load_config = ModelLoadConfig(str(tmp_path), dtype="float32")
-    source = resolve_model_source(load_config)
     parallel = ParallelConfig(devices=("cpu",), collective_backend="gloo")
-    resolved = resolve_model_registration(source, parallel)
-    context = materialize_parallel_context(
-        ParallelTopology.build(parallel), 0, torch_module=torch
+    config = XTokensConfig(
+        model_config=ModelConfig(model=str(tmp_path)),
+        executor_config=ExecutorConfig(dtype="float32", local_files_only=True),
+        parallel_config=parallel,
     )
-    factory = resolved.registration.runner_factory_builder(
-        source, resolved.config, load_config, 0
+    worker = GPUWorker(
+        GPUWorkerConfig(config, ParallelTopology.build(parallel), 0, "env://", 0, 0)
     )
-    runner = factory(context, is_output_rank=True)
-    runner.load_model()
+    with patch.object(Path, "open", autospec=True, side_effect=Path.open) as open_file:
+        worker.init_device()
+        worker.load_model()
+    checkpoint_path = tmp_path.resolve()
+    assert (
+        sum(
+            call.args[0] == checkpoint_path / "config.json"
+            for call in open_file.call_args_list
+        )
+        == 1
+    )
+    runner = worker.model_runner
+    assert isinstance(runner, GPUModelRunner)
     model = runner.model
+    assert model.load_config.model_path == checkpoint_path
     assert model.load_report.missing_parameters == ()
     assert model.load_report.unexpected_tensors == ()
     assert isinstance(model.model, Qwen3_5Model)
@@ -206,24 +223,19 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
     manager.cache_blocks(warm, len(warm.all_token_ids))
     warm.num_computed_tokens = len(warm.all_token_ids)
     compare((chunked,))
+    worker.shutdown()
 
 
 def test_qwen3_5_tp2_loads_and_samples(
-    tmp_path: Path, tiny_qwen3_5: Qwen3_5ForCausalLM
+    tmp_path: Path, tiny_qwen3_5: Qwen3_5ForCausalLM, monkeypatch
 ) -> None:
     save_checkpoint(tmp_path, tiny_qwen3_5, conditional=True)
-    load_config = ModelLoadConfig(str(tmp_path), dtype="float32")
     parallel = ParallelConfig(
         distributed_executor_backend="mp",
         devices=("cpu:0", "cpu:1"),
         tensor_parallel_size=2,
         collective_backend="gloo",
         timeout_s=20,
-    )
-    source = resolve_model_source(load_config)
-    resolved = resolve_model_registration(source, parallel)
-    factory = resolved.registration.runner_factory_builder(
-        source, resolved.config, load_config, 0
     )
     tokens = (1, 2, 3)
     with torch.inference_mode():
@@ -239,12 +251,30 @@ def test_qwen3_5_tp2_loads_and_samples(
         (SchedulerRequest(request, (0,)),),
         {request.request_id: len(tokens)},
     )
-    executor = MultiprocModelExecutor(
-        parallel, factory, kv_cache_config=KVCacheConfig(block_size=4, num_gpu_blocks=8)
+    config = XTokensConfig(
+        model_config=ModelConfig(model=str(tmp_path)),
+        executor_config=ExecutorConfig(dtype="float32", local_files_only=True),
+        parallel_config=parallel,
+        kv_cache_config=KVCacheConfig(block_size=4, num_gpu_blocks=8),
     )
+    executor_class = ModelExecutor.get_class(config.parallel_config)
+    executor = executor_class(config, pad_token_id=0)
+    assert isinstance(executor, MultiprocModelExecutor)
     try:
+        collective_rpc = executor.collective_rpc
+        methods = []
+
+        def record_method(method, *args, **kwargs):
+            methods.append(method)
+            return collective_rpc(method, *args, **kwargs)
+
+        monkeypatch.setattr(executor, "collective_rpc", record_method)
+        assert executor.execute_step(batch) == (expected,)
+        assert methods == ["execute_and_sample"]
+
         output = executor.execute_model(batch)
         assert executor.sample_tokens(output, batch) == (expected,)
+        executor.check_health()
     finally:
         executor.shutdown()
 

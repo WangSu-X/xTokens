@@ -1,19 +1,16 @@
-"""Immutable model loading configuration."""
+"""Configuration for loading a resolved checkpoint."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
 class ModelLoadConfig:
-    model: str
-    revision: str | None = None
-    cache_dir: str | None = None
-    local_files_only: bool = False
+    model_path: Path
+    hf_config: Mapping[str, Any]
     dtype: str = "auto"
     strict_weights: bool = True
-
-    def __post_init__(self) -> None:
-        if not self.model:
-            raise ValueError("model must not be empty")

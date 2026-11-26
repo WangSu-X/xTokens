@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 from x_tokens.config import KVCacheConfig
@@ -15,31 +13,12 @@ from x_tokens.worker.kv_cache import GPUKVCache
 
 from .protocol import (
     ModelRunner,
-    ModelRunnerFactory,
     ModelRunnerInput,
     ModelRunnerOutput,
     SamplingMetadata,
 )
 
 logger = init_logger(__name__)
-
-
-@dataclass(frozen=True, slots=True)
-class GPUModelRunnerFactory(ModelRunnerFactory):
-    """Pickle-friendly factory used by uni and spawn-based mp executors."""
-
-    model_factory: Callable[[ParallelContext], Any]
-    pad_token_id: int
-
-    def __call__(
-        self, context: ParallelContext, *, is_output_rank: bool
-    ) -> GPUModelRunner:
-        return GPUModelRunner(
-            context,
-            self.model_factory(context),
-            pad_token_id=self.pad_token_id,
-            is_output_rank=is_output_rank,
-        )
 
 
 class GPUModelRunner(ModelRunner):

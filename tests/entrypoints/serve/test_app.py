@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from functools import partial
 from unittest.mock import Mock
 
 import pytest
@@ -25,6 +24,7 @@ from x_tokens.engine.protocol import (
 )
 from x_tokens.entrypoints.serve import app as serve_app
 from x_tokens.entrypoints.serve import create_app
+from x_tokens.executor import ModelExecutor
 from x_tokens.executor.protocol import Executor, ModelForwardOutput
 
 
@@ -73,7 +73,7 @@ class FakeExecutor(Executor):
         return tuple(9 for _ in range(batch.num_samples))
 
 
-def _fake_executor_factory(*args: object) -> FakeExecutor:
+def _make_fake_executor(*args: object, **kwargs: object) -> FakeExecutor:
     return FakeExecutor()
 
 
@@ -189,14 +189,13 @@ def test_chat_stream_includes_usage_and_late_error(monkeypatch) -> None:
         assert engine.calls[0].sampling.ignore_eos is True
 
 
-def test_default_client_uses_multiproc_llm_engine(monkeypatch) -> None:
+def test_default_client_uses_multiproc_llm_engine(
+    monkeypatch, install_test_executor
+) -> None:
+    install_test_executor(_make_fake_executor)
     monkeypatch.setattr(
         "x_tokens.engine.llm_engine.TokenizerInputProcessor.from_config",
         lambda *args, **kwargs: FakeInputProcessor(),
-    )
-    monkeypatch.setattr(
-        "x_tokens.entrypoints.serve.app.LLMEngine",
-        partial(LLMEngine, executor_factory=_fake_executor_factory),
     )
     monkeypatch.setattr(
         "x_tokens.engine.llm_engine.TokenizerOutputProcessor",
@@ -217,14 +216,13 @@ def test_default_client_uses_multiproc_llm_engine(monkeypatch) -> None:
     assert response.json()["choices"][0]["finish_reason"] == "stop"
 
 
-def test_multiproc_server_ignores_eos_until_max_tokens(monkeypatch) -> None:
+def test_multiproc_server_ignores_eos_until_max_tokens(
+    monkeypatch, install_test_executor
+) -> None:
+    install_test_executor(_make_fake_executor)
     monkeypatch.setattr(
         "x_tokens.engine.llm_engine.TokenizerInputProcessor.from_config",
         lambda *args, **kwargs: FakeInputProcessor(),
-    )
-    monkeypatch.setattr(
-        "x_tokens.entrypoints.serve.app.LLMEngine",
-        partial(LLMEngine, executor_factory=_fake_executor_factory),
     )
     monkeypatch.setattr(
         "x_tokens.engine.llm_engine.TokenizerOutputProcessor",
@@ -250,16 +248,14 @@ def test_multiproc_server_ignores_eos_until_max_tokens(monkeypatch) -> None:
     assert response.json()["usage"]["completion_tokens"] == 2
 
 
-def test_engine_core_uses_default_registered_model_factory(monkeypatch) -> None:
+def test_engine_core_constructs_the_configured_executor_class(monkeypatch) -> None:
     monkeypatch.setattr(
         "x_tokens.engine.llm_engine.TokenizerInputProcessor.from_config",
         lambda *args, **kwargs: FakeInputProcessor(),
     )
-    registered_factory = Mock(return_value=FakeExecutor())
-    monkeypatch.setattr(
-        "x_tokens.executor.custom_factory.create_registered_model_executor",
-        registered_factory,
-    )
+    executor_class = Mock(return_value=FakeExecutor())
+    get_class = Mock(return_value=executor_class)
+    monkeypatch.setattr(ModelExecutor, "get_class", get_class)
     config = XTokensConfig(
         model_config=ModelConfig(served_model_name="test-model"),
         parallel_config=ParallelConfig(devices=("cpu",), collective_backend="gloo"),
@@ -268,14 +264,15 @@ def test_engine_core_uses_default_registered_model_factory(monkeypatch) -> None:
 
     engine = LLMEngine(config)
 
-    registered_factory.assert_called_once_with(config, 0, frozenset({9}))
+    get_class.assert_called_once_with(config.parallel_config)
+    executor_class.assert_called_once_with(
+        config, pad_token_id=0, eos_token_ids=frozenset({9})
+    )
     asyncio.run(engine.close())
 
 
 @pytest.mark.parametrize("num_gpu_blocks", [0, 1])
-def test_default_factory_cleans_up_invalid_kv_capacity(
-    monkeypatch, num_gpu_blocks
-) -> None:
+def test_engine_core_cleans_up_invalid_kv_capacity(monkeypatch, num_gpu_blocks) -> None:
     monkeypatch.setattr(
         "x_tokens.engine.llm_engine.TokenizerInputProcessor.from_config",
         lambda *args, **kwargs: FakeInputProcessor(),
@@ -283,9 +280,12 @@ def test_default_factory_cleans_up_invalid_kv_capacity(
     executor = FakeExecutor()
     executor.num_gpu_blocks = num_gpu_blocks
     executor.shutdown = Mock()
+    monkeypatch.setattr(
+        ModelExecutor, "get_class", Mock(return_value=Mock(return_value=executor))
+    )
 
+    config = XTokensConfig(server_config=ServerConfig(core_client_mode="in_proc"))
     with pytest.raises((RuntimeError, ValueError), match="KV cache"):
-        config = XTokensConfig(server_config=ServerConfig(core_client_mode="in_proc"))
-        LLMEngine(config, executor_factory=lambda *args: executor)
+        LLMEngine(config)
 
     executor.shutdown.assert_called_once_with()

@@ -34,6 +34,8 @@ from x_tokens.engine.protocol import (
 )
 from x_tokens.executor.protocol import Executor, ModelForwardOutput
 
+pytestmark = pytest.mark.usefixtures("fake_core_executor")
+
 
 class FakeExecutor(Executor):
     eos_token_ids = frozenset((9,))
@@ -73,7 +75,6 @@ def test_inproc_client_owns_core_and_steps_in_the_calling_thread() -> None:
         XTokensConfig(model_config=ModelConfig(served_model_name="test-model")),
         0,
         frozenset({9}),
-        lambda config, pad_token_id, eos_token_ids: FakeExecutor(),
     )
     assert isinstance(client, InProcessClient)
     assert isinstance(client.engine_core, EngineCore)
@@ -99,7 +100,6 @@ def test_inproc_client_uses_kv_cache_scheduler_from_core_config() -> None:
         config,
         0,
         frozenset({9}),
-        lambda config, pad_token_id, eos_token_ids: FakeExecutor(),
     )
     try:
         assert isinstance(client.engine_core.scheduler, Scheduler)
@@ -119,7 +119,7 @@ def test_inproc_client_uses_kv_cache_scheduler_from_core_config() -> None:
 @pytest.mark.parametrize("client_cls", [InProcessClient, MultiProcessClient])
 def test_core_clients_validate_model_and_tokenized_input(client_cls) -> None:
     config = XTokensConfig(model_config=ModelConfig(served_model_name="test-model"))
-    client = client_cls(config, 0, frozenset({9}), _fake_executor_factory)
+    client = client_cls(config, 0, frozenset({9}))
 
     async def receive_outputs() -> None:
         sampling = SamplingParams(2)
@@ -157,7 +157,6 @@ def test_llm_engine_normalizes_direct_inproc_outputs() -> None:
             ),
             input_processor=FakeInputProcessor(),
             output_processor=FakeOutputProcessor(),
-            executor_factory=lambda config, pad_token_id, eos_token_ids: FakeExecutor(),
         )
         assert isinstance(engine.core_client, InProcessClient)
         request = GenerateRequest("request", "test-model", "hello", SamplingParams(2))
@@ -175,7 +174,6 @@ def test_llm_engine_rejects_duplicate_id_without_disrupting_original() -> None:
             XTokensConfig(model_config=ModelConfig(served_model_name="test-model")),
             input_processor=FakeInputProcessor(),
             output_processor=FakeOutputProcessor(),
-            executor_factory=_fake_executor_factory,
         )
         request = GenerateRequest(
             "same-id", "test-model", "hello", SamplingParams(2, ignore_eos=True)
@@ -207,7 +205,6 @@ def test_llm_engine_routes_concurrent_zmq_outputs() -> None:
             config,
             input_processor=FakeInputProcessor(),
             output_processor=FakeOutputProcessor(),
-            executor_factory=_fake_executor_factory,
         )
         try:
             assert isinstance(engine.core_client, MultiProcessClient)
@@ -235,9 +232,14 @@ def test_llm_engine_routes_concurrent_zmq_outputs() -> None:
     asyncio.run(scenario())
 
 
-def _fake_executor_factory(config, pad_token_id, eos_token_ids):
+def _make_fake_executor(config, pad_token_id, eos_token_ids):
     del config, pad_token_id, eos_token_ids
     return FakeExecutor()
+
+
+@pytest.fixture
+def fake_core_executor(install_test_executor) -> None:
+    install_test_executor(_make_fake_executor)
 
 
 def test_multiproc_core_finishes_before_any_get_output() -> None:
@@ -245,7 +247,7 @@ def test_multiproc_core_finishes_before_any_get_output() -> None:
         model_config=ModelConfig(served_model_name="test-model"),
         server_config=ServerConfig(core_client_mode="multi_proc"),
     )
-    client = MultiProcessClient(config, 0, frozenset({9}), _fake_executor_factory)
+    client = MultiProcessClient(config, 0, frozenset({9}))
     finished = CoreFinishedEvent("autonomous", FinishReason.LENGTH, 1, 3)
     try:
         client.add_request(
@@ -280,7 +282,7 @@ def test_multiproc_core_finishes_before_any_get_output() -> None:
 
 def test_multiproc_reports_unknown_request_type_and_keeps_serving() -> None:
     config = XTokensConfig(model_config=ModelConfig(served_model_name="test-model"))
-    client = MultiProcessClient(config, 0, frozenset({9}), _fake_executor_factory)
+    client = MultiProcessClient(config, 0, frozenset({9}))
 
     async def receive_outputs() -> None:
         client.input_socket.send_multipart(
@@ -303,9 +305,7 @@ def test_multiproc_reports_unknown_request_type_and_keeps_serving() -> None:
 
 
 def test_multiproc_reports_process_exit_to_async_receiver() -> None:
-    client = MultiProcessClient(
-        XTokensConfig(), 0, frozenset({9}), _fake_executor_factory
-    )
+    client = MultiProcessClient(XTokensConfig(), 0, frozenset({9}))
     try:
         assert client.process is not None
         client.process.terminate()
@@ -320,7 +320,7 @@ def test_multiproc_reports_process_exit_to_async_receiver() -> None:
 
 def test_cancelled_multiproc_receive_keeps_later_token_events() -> None:
     config = XTokensConfig(model_config=ModelConfig(served_model_name="test-model"))
-    client = MultiProcessClient(config, 0, frozenset({9}), _fake_executor_factory)
+    client = MultiProcessClient(config, 0, frozenset({9}))
 
     async def collect():
         pending = asyncio.create_task(client.get_output())
@@ -355,21 +355,21 @@ class InvalidKVCacheExecutor(FakeExecutor):
         self.shutdown_marker.touch()
 
 
-def _invalid_executor_factory(config, pad_token_id, eos_token_ids, *, shutdown_marker):
+def _make_invalid_executor(config, pad_token_id, eos_token_ids, *, shutdown_marker):
     del config, pad_token_id, eos_token_ids
     return InvalidKVCacheExecutor(shutdown_marker)
 
 
-def test_multiproc_core_reports_startup_failure_and_shuts_down_executor(tmp_path: Path):
+def test_multiproc_core_reports_startup_failure_and_shuts_down_executor(
+    tmp_path: Path, install_test_executor
+) -> None:
     shutdown_marker = tmp_path / "executor-closed"
+    install_test_executor(
+        partial(_make_invalid_executor, shutdown_marker=shutdown_marker)
+    )
     config = XTokensConfig(server_config=ServerConfig(core_client_mode="multi_proc"))
     with pytest.raises(RuntimeError, match="executor did not initialize KV cache"):
-        MultiProcessClient(
-            config,
-            0,
-            frozenset({9}),
-            partial(_invalid_executor_factory, shutdown_marker=shutdown_marker),
-        )
+        MultiProcessClient(config, 0, frozenset({9}))
     assert shutdown_marker.exists()
 
 
@@ -379,7 +379,6 @@ def test_llm_engine_ignores_eos_until_max_tokens() -> None:
             XTokensConfig(model_config=ModelConfig(served_model_name="test-model")),
             input_processor=FakeInputProcessor(),
             output_processor=FakeOutputProcessor(),
-            executor_factory=_fake_executor_factory,
         )
         request = GenerateRequest(
             "eval",

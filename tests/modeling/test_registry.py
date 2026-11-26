@@ -23,7 +23,7 @@ def test_registry_resolves_declared_architecture(
     )
 
     assert registration.architecture == architecture
-    assert callable(registration.runner_factory_builder)
+    assert callable(registration.runner_factory)
 
 
 def test_registry_falls_back_to_unique_model_type() -> None:

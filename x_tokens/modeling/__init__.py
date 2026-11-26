@@ -10,7 +10,7 @@ from .protocol import (
     XTokensModel,
 )
 from .qwen3_5_config import Qwen3_5TextConfig
-from .registry import ModelRegistration, ModelRegistry, resolve_model_registration
+from .registry import ModelRegistration, ModelRegistry
 
 __all__ = [
     "IntermediateTensors",
@@ -23,5 +23,4 @@ __all__ = [
     "Qwen3_5TextConfig",
     "TensorShard",
     "XTokensModel",
-    "resolve_model_registration",
 ]

@@ -22,7 +22,6 @@ from x_tokens.engine.protocol import (
     decode_core_event,
     encode_core_request,
 )
-from x_tokens.executor.protocol import ExecutorFactory
 
 
 class InProcessClient(EngineCoreClient):
@@ -33,13 +32,11 @@ class InProcessClient(EngineCoreClient):
         config: XTokensConfig,
         pad_token_id: int,
         eos_token_ids: frozenset[int],
-        executor_factory: ExecutorFactory | None = None,
     ) -> None:
         from x_tokens.core import EngineCore, EngineCoreConfig
 
         self.engine_core = EngineCore(
-            EngineCoreConfig(config, pad_token_id, eos_token_ids),
-            executor_factory=executor_factory,
+            EngineCoreConfig(config, pad_token_id, eos_token_ids)
         )
         self.closed = False
 
@@ -89,7 +86,6 @@ class MultiProcessClient(EngineCoreClient):
         config: XTokensConfig,
         pad_token_id: int,
         eos_token_ids: frozenset[int],
-        executor_factory: ExecutorFactory | None = None,
     ) -> None:
         from x_tokens.core import EngineCore, EngineCoreConfig
 
@@ -138,7 +134,6 @@ class MultiProcessClient(EngineCoreClient):
                 self.client_identity,
                 output_endpoint,
                 EngineCoreConfig(config, pad_token_id, eos_token_ids),
-                executor_factory,
             ),
             name=f"xtokens-engine-core-{uuid.uuid4().hex[:8]}",
         )

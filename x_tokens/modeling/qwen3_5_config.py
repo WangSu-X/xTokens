@@ -6,8 +6,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from x_tokens.config import ParallelConfig
-
 
 @dataclass(frozen=True, slots=True)
 class Qwen3_5TextConfig:
@@ -96,9 +94,8 @@ class Qwen3_5TextConfig:
             weight_block_size=weight_block_size,
         )
 
-    def validate_parallel(self, parallel_config: ParallelConfig) -> None:
-        tp = parallel_config.tensor_parallel_size
-        if tp not in (1, 2):
+    def validate_tensor_parallel(self, tensor_parallel_size: int) -> None:
+        if tensor_parallel_size not in (1, 2):
             raise ValueError("Qwen3.5 supports TP sizes 1 and 2")
         for name in (
             "num_attention_heads",
@@ -108,7 +105,7 @@ class Qwen3_5TextConfig:
             "intermediate_size",
         ):
             value = getattr(self, name)
-            if value < 1 or value % tp:
+            if value < 1 or value % tensor_parallel_size:
                 raise ValueError(f"{name} must be positive and divisible by TP size")
         if (
             self.num_attention_heads % self.num_key_value_heads

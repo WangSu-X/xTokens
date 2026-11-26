@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
-
-from x_tokens.config import XTokensConfig
 
 if TYPE_CHECKING:
     from x_tokens.core.protocol import SchedulerOutput
@@ -25,9 +22,6 @@ class Executor(Protocol):
     def sample_tokens(
         self, output: ModelForwardOutput, batch: SchedulerOutput
     ) -> tuple[int, ...]: ...
-
-
-ExecutorFactory = Callable[[XTokensConfig, int, frozenset[int]], Executor]
 
 
 @dataclass(frozen=True, slots=True)

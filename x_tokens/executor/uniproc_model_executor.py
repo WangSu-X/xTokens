@@ -15,16 +15,16 @@ class UniProcModelExecutor(ModelExecutor):
         spec = self.topology.runner_group_specs[0]
         worker = GPUWorker(
             GPUWorkerConfig(
-                self.parallel_config,
+                self.config,
                 self.topology,
                 rank=0,
                 distributed_init_method="env://",
                 output_rank=spec.output_rank,
-            ),
-            self.runner_factory,
+                pad_token_id=self.pad_token_id,
+            )
         )
-        worker.init_device()
         try:
+            worker.init_device()
             worker.load_model()
         except Exception:
             worker.shutdown()

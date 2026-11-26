@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import AsyncIterator
 
 from x_tokens.config import XTokensConfig
-from x_tokens.executor.protocol import ExecutorFactory
 
 from .input_processor import TokenizerInputProcessor
 from .output_processor import TokenizerOutputProcessor
@@ -37,7 +36,6 @@ class LLMEngine(LLMEngineProtocol):
         *,
         input_processor: InputProcessor | None = None,
         output_processor: OutputProcessor | None = None,
-        executor_factory: ExecutorFactory | None = None,
         core_client: EngineCoreClient | None = None,
     ) -> None:
         if input_processor is None:
@@ -56,7 +54,6 @@ class LLMEngine(LLMEngineProtocol):
                 config,
                 pad_token_id=input_processor.pad_token_id,
                 eos_token_ids=input_processor.eos_token_ids,
-                executor_factory=executor_factory,
             )
         self.core_client = core_client
         self.input_processor = input_processor
