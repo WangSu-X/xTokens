@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from x_tokens.core.protocol import SchedulerOutput
+    from x_tokens.worker.model_runner.protocol import ModelRunnerOutput
 
 
 class Executor(Protocol):
@@ -17,24 +17,7 @@ class Executor(Protocol):
     @property
     def eos_token_ids(self) -> frozenset[int]: ...
 
-    def execute_model(self, batch: SchedulerOutput) -> ModelForwardOutput: ...
-
-    def sample_tokens(
-        self, output: ModelForwardOutput, batch: SchedulerOutput
-    ) -> tuple[int, ...]: ...
-
-
-@dataclass(frozen=True, slots=True)
-class RunnerStepId:
-    runner_group: int
-    step_id: int
-
-
-@dataclass(frozen=True, slots=True)
-class ModelForwardOutput:
-    """Handle to rank-local state awaiting device-side sampling."""
-
-    runner_step_id: RunnerStepId | None = None
+    def execute_step(self, batch: SchedulerOutput) -> ModelRunnerOutput: ...
 
 
 class WorkerHandle(Protocol):

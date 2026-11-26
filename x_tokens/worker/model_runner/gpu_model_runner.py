@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from x_tokens.config import KVCacheConfig
@@ -13,12 +14,18 @@ from x_tokens.worker.kv_cache import GPUKVCache
 
 from .protocol import (
     ModelRunner,
-    ModelRunnerInput,
     ModelRunnerOutput,
+    ModelRunnerRequest,
     SamplingMetadata,
 )
 
 logger = init_logger(__name__)
+
+
+@dataclass(slots=True)
+class ExecuteModelState:
+    logits: Any
+    sampling_metadata: dict[str, SamplingMetadata]
 
 
 class GPUModelRunner(ModelRunner):
@@ -40,9 +47,7 @@ class GPUModelRunner(ModelRunner):
         self.pad_token_id = pad_token_id
         self.is_output_rank = is_output_rank
         self.torch_module = torch_module
-        self.pending_step_id: int | None = None
-        self.pending_logits: Any | None = None
-        self.pending_sampling: tuple[SamplingMetadata, ...] = ()
+        self.execute_model_state: ExecuteModelState | None = None
         self.kv_cache: GPUKVCache | None = None
 
     def load_model(self) -> None:
@@ -110,99 +115,85 @@ class GPUModelRunner(ModelRunner):
             self.kv_cache.allocated_bytes,
         )
 
-    def execute_model(self, inputs: ModelRunnerInput) -> ModelRunnerOutput | None:
-        if self.pending_step_id is not None:
-            raise RuntimeError(
-                f"runner step {self.pending_step_id} must be sampled before execute"
-            )
-        if not inputs.requests:
-            return ModelRunnerOutput(inputs.step_id) if self.is_output_rank else None
+    def execute_model(self, requests: tuple[ModelRunnerRequest, ...]) -> None:
+        self.execute_model_state = None
+        if not requests:
+            return
         with self.torch_module.inference_mode():
-            output = self._forward(inputs)
+            model_input = self._prepare_model_input(requests)
+            output = self.model(model_input)
+        if not self.is_output_rank:
+            return
+        sample_rows = []
+        sampling_metadata = {}
+        for row, request in enumerate(requests):
+            if request.sampling_metadata is not None:
+                sample_rows.append(row)
+                sampling_metadata[request.request_id] = request.sampling_metadata
+        if not sample_rows:
+            return
+
         logits = output.logits if isinstance(output, ModelOutput) else output
         if logits is None:
-            if self.is_output_rank:
-                raise RuntimeError("output rank model did not produce logits")
-            return None
+            raise RuntimeError("output rank model did not produce logits")
         if logits.ndim == 3:
             logits = logits[:, -1, :]
-        sample_rows = tuple(
-            row
-            for row, request in enumerate(inputs.requests)
-            if request.sampling_metadata is not None
-        )
         if logits.ndim != 2 or logits.shape[0] not in (
-            len(inputs.requests),
+            len(requests),
             len(sample_rows),
         ):
             raise ValueError(
                 "model logits must have shape [batch, vocab] or "
                 "[batch, sequence, vocab]"
             )
-        if not self.is_output_rank:
-            return None
-        self.pending_step_id = inputs.step_id
-        self.pending_logits = (
-            logits if logits.shape[0] == len(sample_rows) else logits[list(sample_rows)]
-        )
-        self.pending_sampling = tuple(
-            request.sampling_metadata
-            for request in inputs.requests
-            if request.sampling_metadata is not None
-        )
-        return ModelRunnerOutput(inputs.step_id)
+        if logits.shape[0] != len(sample_rows):
+            logits = logits[sample_rows]
+        self.execute_model_state = ExecuteModelState(logits, sampling_metadata)
 
-    def _forward(self, inputs: ModelRunnerInput) -> ModelOutput:
-        return self.model(self._prepare_model_input(inputs))
-
-    def sample_tokens(self, step_id: int) -> tuple[int, ...] | None:
-        if not self.is_output_rank:
-            return None
-        if self.pending_step_id != step_id or self.pending_logits is None:
-            raise RuntimeError(
-                f"runner has no pending logits for step {step_id}; "
-                f"pending={self.pending_step_id}"
-            )
-        try:
-            if not self.pending_sampling:
-                return ()
-            if all(item.temperature == 0 for item in self.pending_sampling):
-                return tuple(self.pending_logits.argmax(dim=-1).tolist())
-            return tuple(
-                self._sample(self.pending_logits[index], metadata)
-                for index, metadata in enumerate(self.pending_sampling)
-            )
-        finally:
-            self.pending_step_id = None
-            self.pending_logits = None
-            self.pending_sampling = ()
+    def sample_tokens(self) -> ModelRunnerOutput:
+        state = self.execute_model_state
+        self.execute_model_state = None
+        if state is None:
+            return ModelRunnerOutput()
+        if all(metadata.temperature == 0 for metadata in state.sampling_metadata.values()):
+            token_ids = state.logits.argmax(dim=-1).tolist()
+        else:
+            token_ids = [
+                self._sample(state.logits[index], metadata)
+                for index, metadata in enumerate(state.sampling_metadata.values())
+            ]
+        return ModelRunnerOutput(
+            dict(zip(state.sampling_metadata, token_ids, strict=True))
+        )
 
     def shutdown(self) -> None:
-        self.pending_step_id = None
-        self.pending_logits = None
-        self.pending_sampling = ()
+        self.execute_model_state = None
         if self.kv_cache is not None:
             set_cache = getattr(self.model, "set_kv_cache", None)
             if callable(set_cache):
                 set_cache(None)
             self.kv_cache = None
 
-    def _prepare_model_input(self, inputs: ModelRunnerInput) -> ModelInput:
+    def _prepare_model_input(
+        self, requests: tuple[ModelRunnerRequest, ...]
+    ) -> ModelInput:
         if self.kv_cache is None:
             raise RuntimeError("KV cache is not initialized")
         block_size = self.kv_cache.spec.block_size
-        max_length = max(len(request.token_ids) for request in inputs.requests)
+        max_length = max(len(request.scheduled_token_ids) for request in requests)
         padded = []
         masks = []
         positions = []
         cache_slots = []
-        for request in inputs.requests:
-            query_len = len(request.token_ids)
+        for request in requests:
+            query_len = len(request.scheduled_token_ids)
             start = request.num_computed_tokens
             end = start + query_len
             query_positions = range(start, end)
             padding = max_length - query_len
-            padded.append([self.pad_token_id] * padding + list(request.token_ids))
+            padded.append(
+                [self.pad_token_id] * padding + list(request.scheduled_token_ids)
+            )
             masks.append([0] * padding + [1] * query_len)
             positions.append([0] * padding + list(query_positions))
             slots = tuple(

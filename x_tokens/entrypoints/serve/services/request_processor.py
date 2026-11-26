@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from x_tokens.engine.protocol import SamplingParams
 from x_tokens.entrypoints.serve.openai.protocol import (
     ChatCompletionRequest,
@@ -23,10 +25,22 @@ def process_completion_request(
     return request.prompt, sampling_params
 
 
-def process_chat_request(request: ChatCompletionRequest) -> tuple[str, SamplingParams]:
-    prompt = "\n".join(
-        f"{message.role}: {message.content}" for message in request.messages
-    )
+def process_chat_request(
+    request: ChatCompletionRequest, *, tokenizer: Any | None = None
+) -> tuple[str | tuple[int, ...], SamplingParams]:
+    if getattr(tokenizer, "chat_template", None):
+        prompt = tuple(
+            tokenizer.apply_chat_template(
+                [message.model_dump() for message in request.messages],
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=False,
+            )
+        )
+    else:
+        prompt = "\n".join(
+            f"{message.role}: {message.content}" for message in request.messages
+        )
     sampling_params = SamplingParams(
         max_tokens=request.max_completion_tokens or request.max_tokens or 512,
         temperature=request.temperature,

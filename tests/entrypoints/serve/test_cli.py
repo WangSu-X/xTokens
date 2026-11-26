@@ -52,6 +52,8 @@ def test_cli_builds_explicit_parallel_config(monkeypatch) -> None:
             "mp",
             "--tensor-parallel-size",
             "2",
+            "--data-parallel-size",
+            "1",
             "--parallel-device",
             "cuda:0",
             "--parallel-device",
@@ -68,7 +70,15 @@ def test_cli_builds_explicit_parallel_config(monkeypatch) -> None:
     assert config.scheduler_config.max_num_seqs == 8
     assert config.parallel_config.distributed_executor_backend == "mp"
     assert config.parallel_config.tensor_parallel_size == 2
+    assert config.parallel_config.world_size == 2
     assert config.parallel_config.devices == ("cuda:0", "cuda:1")
+
+
+def test_cli_rejects_multiple_model_replicas() -> None:
+    with pytest.raises(SystemExit) as error:
+        cli.main(["--model", "test-model", "--data-parallel-size", "2"])
+
+    assert error.value.code == 2
 
 
 def test_cli_defaults_served_model_name_to_model(monkeypatch) -> None:

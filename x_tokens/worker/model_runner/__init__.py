@@ -3,7 +3,6 @@
 from .gpu_model_runner import GPUModelRunner
 from .protocol import (
     ModelRunner,
-    ModelRunnerInput,
     ModelRunnerOutput,
     ModelRunnerRequest,
     SamplingMetadata,
@@ -12,7 +11,6 @@ from .protocol import (
 __all__ = [
     "GPUModelRunner",
     "ModelRunner",
-    "ModelRunnerInput",
     "ModelRunnerOutput",
     "ModelRunnerRequest",
     "SamplingMetadata",

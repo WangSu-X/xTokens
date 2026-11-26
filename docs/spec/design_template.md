@@ -142,7 +142,7 @@ x_tokens/
 │   ├── kv_cache.py          # KV Cache 管理（详见下面）
 │   └── scheduler.py         # 调度器
 ├── executor/
-│   ├── base.py              # 执行器基类
+│   ├── protocol.py          # 执行器接口
 │   └── model_executor.py    # 模型执行器
 └── ...
 ```

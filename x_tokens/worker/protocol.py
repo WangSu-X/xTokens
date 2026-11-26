@@ -6,7 +6,7 @@ from typing import Protocol
 
 from x_tokens.config import KVCacheConfig
 
-from .model_runner import ModelRunnerInput, ModelRunnerOutput
+from .model_runner import ModelRunnerOutput, ModelRunnerRequest
 
 
 class ModelWorker(Protocol):
@@ -18,13 +18,9 @@ class ModelWorker(Protocol):
 
     def initialize_kv_cache(self, num_blocks: int, block_size: int) -> None: ...
 
-    def execute_model(self, inputs: ModelRunnerInput) -> ModelRunnerOutput | None: ...
-
     def execute_and_sample(
-        self, inputs: ModelRunnerInput
-    ) -> tuple[int, ...] | None: ...
-
-    def sample_tokens(self, step_id: int) -> tuple[int, ...] | None: ...
+        self, requests: tuple[ModelRunnerRequest, ...]
+    ) -> ModelRunnerOutput | None: ...
 
     def check_health(self) -> None: ...
 

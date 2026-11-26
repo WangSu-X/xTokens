@@ -76,7 +76,7 @@ class KVCacheConfig:
 class ParallelConfig:
     """Immutable process and model-parallel settings.
 
-    The physical rank layout is ``DP x PP x CP x TP``. Expert parallelism is
+    The physical rank layout of a replica is ``PP x CP x TP``. Expert parallelism is
     an overlay on those ranks and therefore does not increase ``world_size``.
     """
 
@@ -92,11 +92,12 @@ class ParallelConfig:
     timeout_s: float = 120.0
 
     def __post_init__(self) -> None:
+        if self.data_parallel_size != 1:
+            raise ValueError("data_parallel_size must be 1 for a single model replica")
         sizes = {
             "tensor_parallel_size": self.tensor_parallel_size,
             "pipeline_parallel_size": self.pipeline_parallel_size,
             "context_parallel_size": self.context_parallel_size,
-            "data_parallel_size": self.data_parallel_size,
         }
         for name, size in sizes.items():
             if size < 1:
@@ -121,25 +122,15 @@ class ParallelConfig:
         if self.enable_expert_parallel:
             ep_size = self.expert_parallel_size or self.model_parallel_size
             if ep_size < 1 or self.model_parallel_size % ep_size != 0:
-                raise ValueError(
-                    "expert_parallel_size must divide TP x CP within a runner group"
-                )
+                raise ValueError("expert_parallel_size must divide TP x CP")
 
     @property
     def model_parallel_size(self) -> int:
         return self.tensor_parallel_size * self.context_parallel_size
 
     @property
-    def runner_group_size(self) -> int:
-        return (
-            self.pipeline_parallel_size
-            * self.context_parallel_size
-            * self.tensor_parallel_size
-        )
-
-    @property
     def world_size(self) -> int:
-        return self.data_parallel_size * self.runner_group_size
+        return self.pipeline_parallel_size * self.model_parallel_size
 
 
 @dataclass(frozen=True, slots=True)

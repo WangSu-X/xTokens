@@ -14,7 +14,6 @@ from queue import Queue
 from typing import TYPE_CHECKING
 
 from x_tokens.core.config import EngineCoreConfig
-from x_tokens.core.protocol import SchedulerOutput
 from x_tokens.core.scheduler import Scheduler
 from x_tokens.engine.protocol import (
     CoreErrorEvent,
@@ -86,9 +85,6 @@ class EngineCore:
                 max_model_len=model_config.max_model_len,
                 kv_cache_config=kv_cache_config,
                 model_fingerprint=model_config.served_model_name,
-            )
-            self.execute_step = getattr(
-                self.executor, "execute_step", self._execute_split_step
             )
         except BaseException:
             self._shutdown_executor(self.executor)
@@ -331,7 +327,12 @@ class EngineCore:
         debug_enabled = logger.isEnabledFor(logging.DEBUG)
         step_started = time.perf_counter() if debug_enabled else 0.0
         try:
-            token_ids = self.execute_step(scheduler_output)
+            model_output = self.executor.execute_step(scheduler_output)
+            scheduler_updates = self.scheduler.update_from_output(
+                scheduler_output,
+                model_output.sampled_token_ids,
+                eos_token_ids=self.executor.eos_token_ids,
+            )
         except Exception as error:
             logger.exception(
                 "model step failed: batch_size=%d request_ids=%s",
@@ -352,27 +353,19 @@ class EngineCore:
                     request.request_id for request in scheduler_output.running_requests
                 ),
             )
-        scheduler_updates = self.scheduler.update_from_output(
-            scheduler_output,
-            token_ids,
-            eos_token_ids=self.executor.eos_token_ids,
-        )
         for scheduler_update in scheduler_updates:
             request = scheduler_update.request
-            is_eos = scheduler_update.token_id in self.executor.eos_token_ids
-            if not is_eos or request.sampling_params.ignore_eos:
+            finish_reason = scheduler_update.finish_reason
+            if finish_reason is not FinishReason.STOP:
                 outputs.add(
                     CoreTokenEvent(
                         request.request_id,
                         scheduler_update.token_id,
                     )
                 )
-            if request.stop_reason is not None:
-                outputs.add(self._finished_event(request, request.stop_reason))
+            if finish_reason is not None:
+                outputs.add(self._finished_event(request, finish_reason))
         return outputs, True
-
-    def _execute_split_step(self, batch: SchedulerOutput) -> tuple[int, ...]:
-        return self.executor.sample_tokens(self.executor.execute_model(batch), batch)
 
     def post_step(self, *, model_executed: bool) -> None:
         """Lifecycle hook reserved for post-forward maintenance."""

@@ -8,11 +8,11 @@
 - **P1/P2 边界**：ModelExecutor 是执行层的统一入口，屏蔽单卡 vs 多卡差异
 - **P2 - ModelRunner Workers**：GPUWorker 和 ModelRunner 实现 SPMD 模型执行
 
-涉及的主要类：`ModelExecutor`（抽象）、`UniProcModelExecutor`、`MultiprocModelExecutor`、`RunnerGroup`、`WorkerHandle`
+涉及的主要类：`ModelExecutor`（抽象）、`UniProcModelExecutor`、`MultiprocModelExecutor`、`WorkerHandle`
 
 ## 摘要
 
-`ModelExecutor` 是 EngineCore 与模型执行层的统一接口。它根据 `ParallelConfig` 的 `distributed_executor_backend` (uni/mp) 选择具体实现，管理 runner group 集合，并通过 collective RPC 或直接调用将 batch forward 和采样请求分发到各 worker。EngineCore 无需关心单卡 vs 多卡，只需调用 `execute_model()` 和 `sample_tokens()` 两个同步接口。当前仅支持张量并行 (TP=1/2/...)；管道并行、专家并行等维度需要未来扩展。
+`ModelExecutor` 是 EngineCore 与模型执行层的统一接口。它根据 `ParallelConfig` 的 `distributed_executor_backend` (uni/mp) 选择具体实现，持有单个模型副本的所有 Worker 句柄，并通过 collective RPC 或直接调用将 batch forward 和采样请求分发到各 worker。EngineCore 无需关心单卡 vs 多卡，只需调用 `execute_model()` 和 `sample_tokens()` 两个同步接口。当前仅支持张量并行 (TP=1/2/...)；管道并行、专家并行等维度需要未来扩展。
 
 ## 背景
 
@@ -114,7 +114,7 @@ executor = executor_class(
 ```
 
 初始化步骤：
-1. Core 调用 `ModelExecutor.get_class()` 根据并行配置选择 Executor 类型，创建的 Executor 校验并行参数并构建拓扑。
+1. Core 调用 `ModelExecutor.get_class()` 根据并行配置选择 Executor 类型，创建的 Executor 校验并行参数并构建单副本拓扑。
 2. Executor 在 `_init_executor()` 中创建 Worker。
    - **UniProcModelExecutor**：直接创建 1 个 GPUWorker，初始化并加载模型
    - **MultiprocModelExecutor**：创建 N 个子进程，每个持有 1 个 GPUWorker
@@ -132,30 +132,28 @@ runner_input = executor._prepare_step(batch)
 responses = executor.collective_rpc(
     "execute_model",
     runner_input,
-    runner_group=0,
 )
 
 # 仅 output rank 返回 ModelRunnerOutput，其他 rank 返回 None
-output = responses[output_rank_index]
-executor.pending_step = RunnerStepId(runner_group=0, step_id=step_counter)
-return ModelForwardOutput(runner_step_id=executor.pending_step)
+output = responses[executor.output_rank]
+executor.pending_step_id = output.step_id
+return ModelForwardOutput(runner_step_id=executor.pending_step_id)
 ```
 
-`_prepare_step()` 将各请求本步的 token 区间、起始位置和 block IDs 组装成 `ModelRunnerRequest`。如果这段 token 覆盖请求全部待计算位置，就附上采样参数。各 rank 的 Runner 计算本地 KV slot，输出 rank 返回计算结果。
+`_prepare_step()` 从 `SchedulerRequest` 读取本步 token、起始位置、block IDs 和可选采样参数，并组装成 `ModelRunnerRequest`。各 rank 的 Runner 计算本地 KV slot，输出 rank 返回计算结果。
 
 #### 3. Sample Tokens
 
 ```python
-step = output.runner_step_id  # 已保存在 _pending_step
+step_id = output.runner_step_id
 
 responses = executor.collective_rpc(
     "sample_tokens",
-    step.step_id,
-    runner_group=step.runner_group,
+    step_id,
 )
 
-token_ids = responses[output_rank_index]
-executor.pending_step = None
+token_ids = responses[executor.output_rank]
+executor.pending_step_id = None
 return token_ids
 ```
 
@@ -168,22 +166,15 @@ return token_ids
 ```python
 class UniProcModelExecutor(ModelExecutor):
     def _init_executor(self):
-        # 创建 1 个 GPUWorker (rank=0) 在当前进程
-        spec = topology.runner_group_specs[0]
-        worker = GPUWorker(config=..., rank=0, ...)
-        worker.init_device()  # CUDA device 初始化
-        worker.load_model()   # 权重加载
-        self.runner_groups = (RunnerGroup(spec, (LocalWorkerHandle(0, worker),)),)
-        
-    def collective_rpc(method, args, runner_group=0):
-        # 直接调用 worker.method(*args)，无 RPC
-        handle = self.runner_groups[0].worker_handles[0]
-        return (handle.worker.method(*args),)
+        worker = GPUWorker(GPUWorkerConfig(..., rank=0, output_rank=self.output_rank))
+        worker.init_device()
+        worker.load_model()
+        self.worker_handles = (LocalWorkerHandle(0, worker),)
 ```
 
 优点：
 - 无进程间通信开销
-- 调试��� CPU 测试方便
+- 便于在 CPU 上调试和测试
 
 缺点：
 - 无法利用多卡
@@ -193,21 +184,11 @@ class UniProcModelExecutor(ModelExecutor):
 ```python
 class MultiprocModelExecutor(ModelExecutor):
     def _init_executor(self):
-        # 为每个 TP rank 创建 1 个子进程
-        for rank in range(topology.tensor_parallel_size):
-            spec = topology.runner_group_specs[rank]
-            process = spawn_worker_process(rank, spec, ...)
-            handle = ProcessWorkerHandle(process, ...)
-            self.runner_groups = (RunnerGroup(..., (handle, ...)),)
-        
-    def collective_rpc(method, args, runner_group=0):
-        # 向所有子进程发送 RPC 请求，等待响应
-        for handle in group.worker_handles:
-            handle.send(method, args)
-        responses = []
-        for handle in group.worker_handles:
-            responses.append(handle.recv(timeout=...))
-        return tuple(responses)
+        handles = []
+        for rank in range(self.topology.world_size):
+            config = GPUWorkerConfig(..., rank=rank, output_rank=self.output_rank)
+            handles.append(spawn_worker(rank, config))
+        self.worker_handles = tuple(handles)
 ```
 
 优点：
@@ -218,14 +199,11 @@ class MultiprocModelExecutor(ModelExecutor):
 - 进程管理和 IPC 复杂
 - 需要处理进程崩溃等异常
 
-### RunnerGroup 和 WorkerHandle
+### 单副本拓扑与 WorkerHandle
+
+`ParallelTopology` 保存 `world_size`、`rank_assignments` 和 `group_specs`。副本内的 rank 按 PP × CP × TP 排列，Executor 按全局 rank 顺序持有全部 `worker_handles`，统一向它们发 RPC。当前 TP 执行固定从 rank 0 取结果。`data_parallel_size=1` 作为单副本配置值保留。
 
 ```python
-@dataclass(slots=True)
-class RunnerGroup:
-    spec: RunnerGroupSpec           # TP rank list, output rank 等
-    worker_handles: tuple[WorkerHandle, ...]  # 该组内的所有 worker 句柄
-
 class WorkerHandle(Protocol):
     def send(method: str, args) -> None: ...     # 异步发送 RPC
     def recv(timeout) -> Any: ...                # 同步接收 RPC 响应
@@ -267,7 +245,7 @@ schedule()
     │
 execute_model(batch)
   ├─ Translate SchedulerOutput to ModelRunnerInput
-  │  - Slice token IDs from the computed prefix
+  │  - Read scheduled token IDs
   │  - Pack sampling metadata
   │  - Pass KV block addresses
   └─ RPC to workers
@@ -310,23 +288,12 @@ def _initialize_kv_cache(self):
 
 ```python
 def check_health(self):
-    # 检查是否有待处理的采样操作
-    if self.pending_step is not None:
-        raise RuntimeError("pending sampled output")
-    
-    # 检查所有 worker
-    for group in self.runner_groups:
-        for handle in group.worker_handles:
-            handle.check_health()
-    
-def shutdown(self):
-    for group in self.runner_groups:
-        for handle in group.worker_handles:
-            handle.shutdown()  # 关闭子进程、清理资源
-    self.runner_groups = ()
+    self._raise_if_failed()
+    for handle in self.worker_handles:
+        handle.check_health()
 ```
 
-若任何 collective RPC 抛异常，立即设置 `_failed_error`，后续所有操作都会先检查此状态并抛 RuntimeError。
+collective RPC 失败时记录 `failed_error`。后续 RPC 和健康检查通过 `_raise_if_failed()` 报告该错误。关闭时由具体 Executor 关闭全部 Worker 并清空 `worker_handles`。
 
 ## 测试与评估
 

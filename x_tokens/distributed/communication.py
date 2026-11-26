@@ -1,25 +1,10 @@
-"""Group-scoped communication interfaces and torch.distributed adapters."""
+"""Process-local collective communication implementations."""
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any
 
-
-class CollectiveGroup(Protocol):
-    rank_in_group: int
-    world_size: int
-
-    def all_reduce(self, tensor: Any) -> Any: ...
-
-    def all_gather(self, tensor: Any, dim: int = 0) -> Any: ...
-
-    def broadcast(self, tensor: Any, src: int = 0) -> Any: ...
-
-    def send(self, tensor: Any, dst: int) -> None: ...
-
-    def recv(self, tensor: Any, src: int) -> None: ...
-
-    def barrier(self) -> None: ...
+from .protocol import CollectiveGroup
 
 
 class SingletonCollectiveGroup(CollectiveGroup):
@@ -63,52 +48,53 @@ class TorchDistributedCollectiveGroup(CollectiveGroup):
         *,
         torch_module: Any,
     ) -> None:
-        self._process_group = process_group
-        self._ranks = ranks
-        self._torch = torch_module
+        self.process_group = process_group
+        self.ranks = ranks
+        self.torch_module = torch_module
         self.rank_in_group = ranks.index(global_rank)
         self.world_size = len(ranks)
 
     def all_reduce(self, tensor: Any) -> Any:
-        with self._torch.inference_mode(False):
+        with self.torch_module.inference_mode(False):
             output = tensor.clone()
-            self._torch.distributed.all_reduce(output, group=self._process_group)
+            self.torch_module.distributed.all_reduce(output, group=self.process_group)
         return output
 
     def all_gather(self, tensor: Any, dim: int = 0) -> Any:
-        with self._torch.inference_mode(False):
+        with self.torch_module.inference_mode(False):
             input_tensor = tensor.clone()
             outputs = [
-                self._torch.empty_like(input_tensor) for _ in range(self.world_size)
+                self.torch_module.empty_like(input_tensor)
+                for _ in range(self.world_size)
             ]
-            self._torch.distributed.all_gather(
-                outputs, input_tensor, group=self._process_group
+            self.torch_module.distributed.all_gather(
+                outputs, input_tensor, group=self.process_group
             )
-            return self._torch.cat(outputs, dim=dim)
+            return self.torch_module.cat(outputs, dim=dim)
 
     def broadcast(self, tensor: Any, src: int = 0) -> Any:
         self._validate_group_rank(src)
-        with self._torch.inference_mode(False):
+        with self.torch_module.inference_mode(False):
             output = tensor.clone()
-            self._torch.distributed.broadcast(
-                output, src=self._ranks[src], group=self._process_group
+            self.torch_module.distributed.broadcast(
+                output, src=self.ranks[src], group=self.process_group
             )
         return output
 
     def send(self, tensor: Any, dst: int) -> None:
         self._validate_group_rank(dst)
-        self._torch.distributed.send(
-            tensor, dst=self._ranks[dst], group=self._process_group
+        self.torch_module.distributed.send(
+            tensor, dst=self.ranks[dst], group=self.process_group
         )
 
     def recv(self, tensor: Any, src: int) -> None:
         self._validate_group_rank(src)
-        self._torch.distributed.recv(
-            tensor, src=self._ranks[src], group=self._process_group
+        self.torch_module.distributed.recv(
+            tensor, src=self.ranks[src], group=self.process_group
         )
 
     def barrier(self) -> None:
-        self._torch.distributed.barrier(group=self._process_group)
+        self.torch_module.distributed.barrier(group=self.process_group)
 
     def _validate_group_rank(self, rank: int) -> None:
         if rank < 0 or rank >= self.world_size:

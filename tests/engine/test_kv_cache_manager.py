@@ -33,6 +33,22 @@ def request(
     )
 
 
+def sampled_tokens(batch, token_ids: tuple[int, ...]) -> dict[str, int]:
+    return {
+        item.request_id: token_id
+        for item, token_id in zip(
+            (
+                item
+                for item in batch.running_requests
+                if item.sampling_params is not None
+            ),
+            token_ids,
+            strict=True,
+        )
+    }
+
+
+
 def allocate_remaining(
     manager: KVCacheManager, request: EngineCoreRequest
 ) -> tuple[int, ...] | None:
@@ -184,17 +200,23 @@ def test_kv_continuous_batching_schedules_running_and_waiting_together() -> None
 
     first = scheduler.schedule()
     assert first.num_scheduled_tokens == {"a": 2}
-    scheduler.update_from_output(first, (3,), eos_token_ids=frozenset())
+    scheduler.update_from_output(
+        first, sampled_tokens(first, (3,)), eos_token_ids=frozenset()
+    )
 
     scheduler.add_request(request("b", (5, 6), max_tokens=2))
     second = scheduler.schedule()
     assert second.num_scheduled_tokens == {"a": 1, "b": 2}
-    scheduler.update_from_output(second, (4, 7), eos_token_ids=frozenset())
+    scheduler.update_from_output(
+        second, sampled_tokens(second, (4, 7)), eos_token_ids=frozenset()
+    )
 
     third = scheduler.schedule()
     assert third.num_scheduled_tokens == {"a": 1, "b": 1}
     assert [item.request_id for item in third.running_requests] == ["a", "b"]
-    scheduler.update_from_output(third, (8, 9), eos_token_ids=frozenset())
+    scheduler.update_from_output(
+        third, sampled_tokens(third, (8, 9)), eos_token_ids=frozenset()
+    )
 
     assert not scheduler.has_work
     assert scheduler.kv_cache_manager.stats().active_blocks == 0
@@ -228,13 +250,13 @@ def test_kv_scheduler_ignore_eos_finishes_at_generation_limit() -> None:
     scheduler.add_request(request("ignore-eos", (1,), max_tokens=2, ignore_eos=True))
     first = scheduler.schedule()
     first_update = scheduler.update_from_output(
-        first, (9,), eos_token_ids=frozenset((9,))
+        first, sampled_tokens(first, (9,)), eos_token_ids=frozenset((9,))
     )
     assert first_update[0].finish_reason is None
 
     second = scheduler.schedule()
     second_update = scheduler.update_from_output(
-        second, (9,), eos_token_ids=frozenset((9,))
+        second, sampled_tokens(second, (9,)), eos_token_ids=frozenset((9,))
     )
     assert second_update[0].finish_reason is not None
     assert scheduler.kv_cache_manager.stats().active_blocks == 0
@@ -250,9 +272,13 @@ def test_kv_scheduler_preempts_when_decode_needs_another_block() -> None:
     scheduler.add_request(request("a", (1,)))
     scheduler.add_request(request("b", (2,)))
     prefill = scheduler.schedule()
-    scheduler.update_from_output(prefill, (3, 4), eos_token_ids=frozenset())
+    scheduler.update_from_output(
+        prefill, sampled_tokens(prefill, (3, 4)), eos_token_ids=frozenset()
+    )
     decode = scheduler.schedule()
-    scheduler.update_from_output(decode, (5, 6), eos_token_ids=frozenset())
+    scheduler.update_from_output(
+        decode, sampled_tokens(decode, (5, 6)), eos_token_ids=frozenset()
+    )
 
     after_preemption = scheduler.schedule()
 
@@ -261,15 +287,23 @@ def test_kv_scheduler_preempts_when_decode_needs_another_block() -> None:
     victim = scheduler.waiting[0]
     assert victim.num_computed_tokens == 0
     assert victim.block_hashes == []
-    scheduler.update_from_output(after_preemption, (7,), eos_token_ids=frozenset())
+    scheduler.update_from_output(
+        after_preemption,
+        sampled_tokens(after_preemption, (7,)),
+        eos_token_ids=frozenset(),
+    )
 
     resumed = scheduler.schedule()
     assert [item.request_id for item in resumed.running_requests] == ["b"]
-    assert resumed.running_requests[0].request is victim
+    assert scheduler.running["b"] is victim
+    assert resumed.running_requests[0].num_computed_tokens == 2
+    assert resumed.running_requests[0].scheduled_token_ids == (6,)
     assert victim.num_computed_tokens == 2
     assert victim.all_token_ids == (2, 4, 6)
     assert resumed.num_scheduled_tokens == {"b": 1}
-    final = scheduler.update_from_output(resumed, (8,), eos_token_ids=frozenset())
+    final = scheduler.update_from_output(
+        resumed, sampled_tokens(resumed, (8,)), eos_token_ids=frozenset()
+    )
     assert final[0].request.output_token_ids == [4, 6, 8]
     assert not scheduler.has_work
 
@@ -305,8 +339,9 @@ def test_scheduler_retries_allocation_after_preempting_the_running_tail() -> Non
     scheduler.add_request(request("head", (1, 2)))
     scheduler.add_request(request("middle", (3,)))
     scheduler.add_request(request("tail", (4, 5)))
+    batch = scheduler.schedule()
     scheduler.update_from_output(
-        scheduler.schedule(), (6, 7, 8), eos_token_ids=frozenset()
+        batch, sampled_tokens(batch, (6, 7, 8)), eos_token_ids=frozenset()
     )
 
     batch = scheduler.schedule()

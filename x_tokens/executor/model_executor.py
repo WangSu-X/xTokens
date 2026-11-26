@@ -4,26 +4,18 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import suppress
-from dataclasses import dataclass
 from typing import Any
 
 from x_tokens.config import ParallelConfig, XTokensConfig
 from x_tokens.core.protocol import SchedulerOutput
-from x_tokens.distributed import ParallelTopology, RunnerGroupSpec
+from x_tokens.distributed import ParallelTopology
 from x_tokens.worker.model_runner import (
-    ModelRunnerInput,
     ModelRunnerOutput,
     ModelRunnerRequest,
     SamplingMetadata,
 )
 
-from .protocol import Executor, ModelForwardOutput, RunnerStepId, WorkerHandle
-
-
-@dataclass(slots=True)
-class RunnerGroup:
-    spec: RunnerGroupSpec
-    worker_handles: tuple[WorkerHandle, ...]
+from .protocol import Executor, WorkerHandle
 
 
 class ModelExecutor(Executor, ABC):
@@ -55,7 +47,6 @@ class ModelExecutor(Executor, ABC):
         unsupported_sizes = {
             "pipeline_parallel_size": parallel_config.pipeline_parallel_size,
             "context_parallel_size": parallel_config.context_parallel_size,
-            "data_parallel_size": parallel_config.data_parallel_size,
         }
         unsupported = [name for name, size in unsupported_sizes.items() if size != 1]
         if parallel_config.enable_expert_parallel:
@@ -71,10 +62,9 @@ class ModelExecutor(Executor, ABC):
         self.topology = ParallelTopology.build(parallel_config)
         self.configured_eos_token_ids = eos_token_ids
         self.num_gpu_blocks = 0
-        self.next_step_id = 0
-        self.pending_step: RunnerStepId | None = None
         self.failed_error: BaseException | None = None
-        self.runner_groups: tuple[RunnerGroup, ...] = ()
+        self.output_rank = 0
+        self.worker_handles: tuple[WorkerHandle, ...] = ()
         self._init_executor()
         try:
             self._initialize_kv_cache()
@@ -94,16 +84,16 @@ class ModelExecutor(Executor, ABC):
         self,
         method: str,
         *args: Any,
-        runner_group: int = 0,
     ) -> tuple[Any, ...]:
         self._raise_if_failed()
-        group = self._group(runner_group)
+        if not self.worker_handles:
+            raise RuntimeError("model executor has no active workers")
         try:
-            for handle in group.worker_handles:
+            for handle in self.worker_handles:
                 handle.send(method, args)
             responses: list[Any] = []
             first_error: Exception | None = None
-            for handle in group.worker_handles:
+            for handle in self.worker_handles:
                 try:
                     responses.append(handle.recv(self.parallel_config.timeout_s))
                 except Exception as error:  # noqa: BLE001 - drain every rank response.
@@ -117,107 +107,45 @@ class ModelExecutor(Executor, ABC):
             self.failed_error = error
             raise
 
-    def execute_model(self, batch: SchedulerOutput) -> ModelForwardOutput:
+    def execute_step(self, batch: SchedulerOutput) -> ModelRunnerOutput:
         if not batch.running_requests:
-            return ModelForwardOutput()
-        runner_input = self._prepare_step(batch)
-        step = RunnerStepId(0, runner_input.step_id)
-        response = self._output_response(
-            self.collective_rpc("execute_model", runner_input), runner_group=0
-        )
-        if (
-            not isinstance(response, ModelRunnerOutput)
-            or response.step_id != step.step_id
-        ):
-            raise RuntimeError(
-                f"output rank returned an invalid result for step {step.step_id}"
-            )
-        self.pending_step = step
-        return ModelForwardOutput(runner_step_id=step)
-
-    def execute_step(self, batch: SchedulerOutput) -> tuple[int, ...]:
-        if not batch.running_requests:
-            return ()
-        inputs = self._prepare_step(batch)
+            return ModelRunnerOutput()
+        inputs = self.prepare_worker_input(batch)
         responses = self.collective_rpc("execute_and_sample", inputs)
-        return self._read_token_batch(responses, batch.num_samples, runner_group=0)
+        output = responses[self.output_rank]
+        if not isinstance(output, ModelRunnerOutput):
+            raise TypeError("output rank returned an invalid model result")
+        return output
 
-    def _prepare_step(self, batch: SchedulerOutput) -> ModelRunnerInput:
-        if self.pending_step is not None:
-            raise RuntimeError(
-                f"executor step {self.pending_step.step_id} must be sampled first"
-            )
-        step_id = self.next_step_id
-        self.next_step_id += 1
+    def prepare_worker_input(
+        self, batch: SchedulerOutput
+    ) -> tuple[ModelRunnerRequest, ...]:
         requests = []
         for item in batch.running_requests:
-            request = item.request
-            start = request.num_computed_tokens
-            count = batch.num_scheduled_tokens[item.request_id]
-            sampling = request.sampling_params
+            sampling = item.sampling_params
+            sampling_metadata = (
+                SamplingMetadata(sampling.temperature, sampling.top_p, sampling.top_k)
+                if sampling is not None
+                else None
+            )
             requests.append(
                 ModelRunnerRequest(
-                    request.all_token_ids[start : start + count],
-                    start,
-                    item.block_ids,
-                    SamplingMetadata(
-                        sampling.temperature, sampling.top_p, sampling.top_k
-                    )
-                    if count == request.num_uncomputed_tokens
-                    else None,
+                    request_id=item.request_id,
+                    scheduled_token_ids=item.scheduled_token_ids,
+                    num_computed_tokens=item.num_computed_tokens,
+                    block_ids=item.block_ids,
+                    sampling_metadata=sampling_metadata,
                 )
             )
-        return ModelRunnerInput(step_id, tuple(requests))
-
-    def sample_tokens(
-        self, output: ModelForwardOutput, batch: SchedulerOutput
-    ) -> tuple[int, ...]:
-        if not batch.running_requests:
-            return ()
-        step = output.runner_step_id
-        if not isinstance(step, RunnerStepId) or step != self.pending_step:
-            raise RuntimeError("model output does not identify the pending runner step")
-        try:
-            responses = self.collective_rpc(
-                "sample_tokens", step.step_id, runner_group=step.runner_group
-            )
-            return self._read_token_batch(
-                responses, batch.num_samples, runner_group=step.runner_group
-            )
-        finally:
-            self.pending_step = None
+        return tuple(requests)
 
     def check_health(self) -> None:
         self._raise_if_failed()
-        for group in self.runner_groups:
-            for handle in group.worker_handles:
-                handle.check_health()
+        for handle in self.worker_handles:
+            handle.check_health()
 
     @abstractmethod
     def shutdown(self) -> None: ...
-
-    def _group(self, index: int) -> RunnerGroup:
-        if index < 0 or index >= len(self.runner_groups):
-            raise ValueError(f"unknown runner group: {index}")
-        return self.runner_groups[index]
-
-    def _output_response(self, responses: tuple[Any, ...], *, runner_group: int) -> Any:
-        output_index = self._output_handle_index(self._group(runner_group))
-        if any(
-            item is not None
-            for index, item in enumerate(responses)
-            if index != output_index
-        ):
-            raise RuntimeError("a non-output rank returned a model result")
-        return responses[output_index]
-
-    def _read_token_batch(
-        self, responses: tuple[Any, ...], batch_size: int, *, runner_group: int
-    ) -> tuple[int, ...]:
-        token_ids = self._output_response(responses, runner_group=runner_group)
-        if not isinstance(token_ids, tuple) or len(token_ids) != batch_size:
-            raise RuntimeError("output rank returned an invalid token batch")
-        return token_ids
 
     def _raise_if_failed(self) -> None:
         if self.failed_error is not None:
@@ -238,7 +166,3 @@ class ModelExecutor(Executor, ABC):
             self.num_gpu_blocks,
             kv_cache_config.block_size,
         )
-
-    @staticmethod
-    def _output_handle_index(group: RunnerGroup) -> int:
-        return group.spec.ranks.index(group.spec.output_rank)

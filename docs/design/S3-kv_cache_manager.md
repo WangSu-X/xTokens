@@ -21,7 +21,7 @@ Qwen3.5 的全注意力和线性注意力使用同一套 block IDs。全注意�
 
 ## 设计概述
 
-请求的计算进度和前缀 hash 保存在 `EngineCoreRequest`。Scheduler 将请求和 block IDs 组合成 `SchedulerRequest`。ModelExecutor 把本步 token 区间和 block IDs 交给 GPUModelRunner。
+请求的计算进度和前缀 hash 保存在 `EngineCoreRequest`。Scheduler 将本步 token、计算起点和 block IDs 记录到 `SchedulerRequest`。ModelExecutor 把本步 token 区间和 block IDs 交给 GPUModelRunner。
 
 ## 详细设计
 

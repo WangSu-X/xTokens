@@ -32,7 +32,6 @@ from x_tokens.modeling.models.qwen3_5 import (
 from x_tokens.worker import GPUWorker, GPUWorkerConfig
 from x_tokens.worker.model_runner import (
     GPUModelRunner,
-    ModelRunnerInput,
     ModelRunnerRequest,
     SamplingMetadata,
 )
@@ -155,13 +154,15 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
             block_ids = manager.get_block_ids(request.request_id)
             runner_requests.append(
                 ModelRunnerRequest(
-                    request.all_token_ids[-count:],
-                    request.num_computed_tokens,
-                    block_ids,
-                    None,
+                    request_id=request.request_id,
+                    scheduled_token_ids=request.all_token_ids[-count:],
+                    num_computed_tokens=request.num_computed_tokens,
+                    block_ids=block_ids,
+                    sampling_metadata=SamplingMetadata(0, 1, None),
                 )
             )
-        actual = runner._forward(ModelRunnerInput(0, tuple(runner_requests))).logits
+        runner.execute_model(tuple(runner_requests))
+        actual = runner.execute_model_state.logits
         for index, request in enumerate(requests):
             expected = hf_model(
                 input_ids=torch.tensor([request.all_token_ids]),
@@ -172,6 +173,7 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
             end = len(request.all_token_ids)
             manager.cache_blocks(request, end)
             request.num_computed_tokens = end
+        runner.sample_tokens()
 
     prompt = (1, 2, 3, 4, 5, 6, 7, 8, 9)
     cold = EngineCoreRequest("cold", SamplingParams(), prompt)
@@ -197,13 +199,16 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
     warm_decode = manager.get_block_ids(warm.request_id)
     greedy = SamplingMetadata(0, 1, None)
     runner.execute_model(
-        ModelRunnerInput(
-            1,
-            (
-                ModelRunnerRequest(chunked.prompt_token_ids[:3], 0, first_chunk, None),
-                ModelRunnerRequest(
-                    (12,), warm.num_computed_tokens, warm_decode, greedy
-                ),
+        (
+            ModelRunnerRequest(
+                "chunked", chunked.prompt_token_ids[:3], 0, first_chunk, None
+            ),
+            ModelRunnerRequest(
+                "warm",
+                (12,),
+                warm.num_computed_tokens,
+                warm_decode,
+                greedy,
             ),
         )
     )
@@ -217,7 +222,7 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
             .logits.argmax(dim=-1)
             .item()
         )
-    assert runner.sample_tokens(1) == (expected,)
+    assert runner.sample_tokens().sampled_token_ids == {"warm": expected}
     manager.cache_blocks(chunked, 3)
     chunked.num_computed_tokens = 3
     manager.cache_blocks(warm, len(warm.all_token_ids))
@@ -246,9 +251,15 @@ def test_qwen3_5_tp2_loads_and_samples(
             .logits.argmax(dim=-1)
             .item()
         )
-    request = EngineCoreRequest("request", SamplingParams(temperature=0), tokens)
+    request = SchedulerRequest(
+        request_id="request",
+        scheduled_token_ids=tokens,
+        num_computed_tokens=0,
+        block_ids=(0,),
+        sampling_params=SamplingParams(temperature=0),
+    )
     batch = SchedulerOutput(
-        (SchedulerRequest(request, (0,)),),
+        (request,),
         {request.request_id: len(tokens)},
     )
     config = XTokensConfig(
@@ -261,6 +272,8 @@ def test_qwen3_5_tp2_loads_and_samples(
     executor = executor_class(config, pad_token_id=0)
     assert isinstance(executor, MultiprocModelExecutor)
     try:
+        assert tuple(handle.rank for handle in executor.worker_handles) == (0, 1)
+        assert executor.output_rank == 0
         collective_rpc = executor.collective_rpc
         methods = []
 
@@ -269,11 +282,9 @@ def test_qwen3_5_tp2_loads_and_samples(
             return collective_rpc(method, *args, **kwargs)
 
         monkeypatch.setattr(executor, "collective_rpc", record_method)
-        assert executor.execute_step(batch) == (expected,)
+        assert executor.execute_step(batch).sampled_token_ids == {"request": expected}
         assert methods == ["execute_and_sample"]
-
-        output = executor.execute_model(batch)
-        assert executor.sample_tokens(output, batch) == (expected,)
+        assert executor.execute_step(batch).sampled_token_ids == {"request": expected}
         executor.check_health()
     finally:
         executor.shutdown()

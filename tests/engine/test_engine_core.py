@@ -20,7 +20,8 @@ from x_tokens.engine.protocol import (
     SamplingParams,
 )
 from x_tokens.executor import ModelExecutor
-from x_tokens.executor.protocol import Executor, ModelForwardOutput
+from x_tokens.executor.protocol import Executor
+from x_tokens.worker.model_runner import ModelRunnerOutput
 
 
 class FakeExecutor(Executor):
@@ -31,15 +32,13 @@ class FakeExecutor(Executor):
         self.token_ids = iter(token_ids)
         self.batches: list[list[str]] = []
 
-    def execute_model(self, batch: SchedulerOutput) -> ModelForwardOutput:
+    def execute_step(self, batch: SchedulerOutput) -> ModelRunnerOutput:
         self.batches.append([request.request_id for request in batch.running_requests])
-        return ModelForwardOutput()
-
-    def sample_tokens(
-        self, output: ModelForwardOutput, batch: SchedulerOutput
-    ) -> tuple[int, ...]:
-        del output
-        return tuple(next(self.token_ids) for _ in range(batch.num_samples))
+        sampled_token_ids = {}
+        for request in batch.running_requests:
+            if request.sampling_params is not None:
+                sampled_token_ids[request.request_id] = next(self.token_ids)
+        return ModelRunnerOutput(sampled_token_ids)
 
 
 def create_core(
@@ -215,7 +214,7 @@ def test_core_passes_resolved_executor_cache_capacity_to_scheduler() -> None:
 def test_core_model_failure_releases_kv_blocks(monkeypatch) -> None:
     executor = FakeExecutor([])
     monkeypatch.setattr(
-        executor, "execute_model", Mock(side_effect=RuntimeError("failed"))
+        executor, "execute_step", Mock(side_effect=RuntimeError("failed"))
     )
     core = create_core(executor)
     core.add_request(request("failed"))

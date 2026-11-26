@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from x_tokens.worker import GPUWorker, GPUWorkerConfig
 
-from .model_executor import ModelExecutor, RunnerGroup
+from .model_executor import ModelExecutor
 from .worker_handle import LocalWorkerHandle
 
 
@@ -12,14 +12,13 @@ class UniProcModelExecutor(ModelExecutor):
     def _init_executor(self) -> None:
         if self.parallel_config.distributed_executor_backend != "uni":
             raise ValueError("UniProcModelExecutor requires the uni backend")
-        spec = self.topology.runner_group_specs[0]
         worker = GPUWorker(
             GPUWorkerConfig(
                 self.config,
                 self.topology,
                 rank=0,
                 distributed_init_method="env://",
-                output_rank=spec.output_rank,
+                output_rank=self.output_rank,
                 pad_token_id=self.pad_token_id,
             )
         )
@@ -29,13 +28,10 @@ class UniProcModelExecutor(ModelExecutor):
         except Exception:
             worker.shutdown()
             raise
-        self.runner_groups = (RunnerGroup(spec, (LocalWorkerHandle(0, worker),)),)
+        self.worker_handles = (LocalWorkerHandle(0, worker),)
 
     def shutdown(self) -> None:
-        if not self.runner_groups:
-            return
-        group = self.runner_groups[0]
-        for handle in group.worker_handles:
+        for handle in self.worker_handles:
             if isinstance(handle, LocalWorkerHandle):
                 handle.worker.shutdown()
-        self.runner_groups = ()
+        self.worker_handles = ()

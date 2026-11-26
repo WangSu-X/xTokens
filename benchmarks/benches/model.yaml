@@ -1,0 +1,4 @@
+input_tokens: [1024, 8192, 16384]
+decode_steps: 24
+samples: 8
+warmup: 1

@@ -7,7 +7,7 @@ from torch import nn
 from x_tokens.config import KVCacheConfig, ParallelConfig, XTokensConfig
 from x_tokens.core.protocol import SchedulerOutput, SchedulerRequest
 from x_tokens.distributed import ParallelContext
-from x_tokens.engine.protocol import EngineCoreRequest, SamplingParams
+from x_tokens.engine.protocol import SamplingParams
 from x_tokens.executor import (
     ModelExecutor,
     MultiprocModelExecutor,
@@ -16,7 +16,11 @@ from x_tokens.executor import (
 from x_tokens.kv_cache import KVCacheSpec
 from x_tokens.modeling import ModelInput, ModelOutput
 from x_tokens.worker import GPUWorker
-from x_tokens.worker.model_runner import GPUModelRunner
+from x_tokens.worker.model_runner import (
+    GPUModelRunner,
+    ModelRunnerOutput,
+    ModelRunnerRequest,
+)
 
 
 class TinyNextTokenModel(nn.Module):
@@ -61,13 +65,17 @@ def batch(*contexts: tuple[int, ...]) -> SchedulerOutput:
     requests = []
     num_scheduled_tokens = {}
     for index, context in enumerate(contexts):
-        request = EngineCoreRequest(
-            f"request-{index}",
-            SamplingParams(max_tokens=2, temperature=0),
-            context,
+        request_id = f"request-{index}"
+        requests.append(
+            SchedulerRequest(
+                request_id=request_id,
+                scheduled_token_ids=context,
+                num_computed_tokens=0,
+                block_ids=(index,),
+                sampling_params=SamplingParams(max_tokens=2, temperature=0),
+            )
         )
-        requests.append(SchedulerRequest(request, (index,)))
-        num_scheduled_tokens[request.request_id] = len(context)
+        num_scheduled_tokens[request_id] = len(context)
     return SchedulerOutput(tuple(requests), num_scheduled_tokens)
 
 
@@ -83,16 +91,15 @@ def cache_config() -> KVCacheConfig:
 
 
 @pytest.mark.usefixtures("tiny_runner")
-def test_uniproc_executor_runs_pending_step_and_samples_on_device() -> None:
+def test_uniproc_executor_samples_by_request_id() -> None:
     executor = UniProcModelExecutor(
         cpu_config(cache_config()), pad_token_id=0, eos_token_ids=frozenset((15,))
     )
     scheduled = batch((1, 2), (4,))
     try:
-        output = executor.execute_model(scheduled)
+        output = executor.execute_step(scheduled)
 
-        assert output.runner_step_id is not None
-        assert executor.sample_tokens(output, scheduled) == (3, 5)
+        assert output == ModelRunnerOutput({"request-0": 3, "request-1": 5})
         assert executor.eos_token_ids == frozenset((15,))
         executor.check_health()
     finally:
@@ -120,13 +127,39 @@ def test_executor_class_selection_is_independent_of_model_factory() -> None:
 
 
 @pytest.mark.usefixtures("tiny_runner")
-def test_executor_rejects_execute_execute_without_sampling() -> None:
+def test_executor_runs_steps_serially_without_step_ids() -> None:
     executor = UniProcModelExecutor(cpu_config(cache_config()), pad_token_id=0)
     scheduled = batch((1,))
     try:
-        executor.execute_model(scheduled)
-        with pytest.raises(RuntimeError, match="sampled first"):
-            executor.execute_model(scheduled)
+        first = executor.execute_step(scheduled)
+        second = executor.execute_step(scheduled)
+        assert first.sampled_token_ids == second.sampled_token_ids
+    finally:
+        executor.shutdown()
+
+
+@pytest.mark.usefixtures("tiny_runner")
+def test_executor_passes_only_the_scheduled_chunk_to_worker() -> None:
+    executor = UniProcModelExecutor(cpu_config(cache_config()), pad_token_id=0)
+    scheduled_request = SchedulerRequest(
+        request_id="prefill",
+        scheduled_token_ids=(7, 8, 9),
+        num_computed_tokens=4,
+        block_ids=(1, 2),
+        sampling_params=None,
+    )
+    batch = SchedulerOutput((scheduled_request,), {"prefill": 3})
+
+    try:
+        assert executor.prepare_worker_input(batch) == (
+            ModelRunnerRequest(
+                request_id="prefill",
+                scheduled_token_ids=(7, 8, 9),
+                num_computed_tokens=4,
+                block_ids=(1, 2),
+                sampling_metadata=None,
+            ),
+        )
     finally:
         executor.shutdown()
 
@@ -146,7 +179,7 @@ def test_executor_shuts_down_workers_when_cache_initialization_fails() -> None:
     class TrackedExecutor(UniProcModelExecutor):
         def shutdown(self) -> None:
             super().shutdown()
-            assert not self.runner_groups
+            assert not self.worker_handles
             shutdowns.append(self)
 
     shutdowns = []

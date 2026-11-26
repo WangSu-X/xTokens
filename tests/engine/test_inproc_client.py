@@ -32,7 +32,8 @@ from x_tokens.engine.protocol import (
     SamplingParams,
     TokenEvent,
 )
-from x_tokens.executor.protocol import Executor, ModelForwardOutput
+from x_tokens.executor.protocol import Executor
+from x_tokens.worker.model_runner import ModelRunnerOutput
 
 pytestmark = pytest.mark.usefixtures("fake_core_executor")
 
@@ -41,14 +42,14 @@ class FakeExecutor(Executor):
     eos_token_ids = frozenset((9,))
     num_gpu_blocks = 256
 
-    def execute_model(self, batch: SchedulerOutput) -> ModelForwardOutput:
-        return ModelForwardOutput()
-
-    def sample_tokens(
-        self, output: ModelForwardOutput, batch: SchedulerOutput
-    ) -> tuple[int, ...]:
-        del output
-        return tuple(9 for _ in range(batch.num_samples))
+    def execute_step(self, batch: SchedulerOutput) -> ModelRunnerOutput:
+        return ModelRunnerOutput(
+            {
+                request.request_id: 9
+                for request in batch.running_requests
+                if request.sampling_params is not None
+            }
+        )
 
 
 class FakeInputProcessor(InputProcessor):

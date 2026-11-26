@@ -44,3 +44,8 @@ def test_output_processor_decodes_incrementally_and_cleans_up() -> None:
     assert processor.process_token("request", 105) == "i"
     processor.finish("request")
     assert processor.process_token("request", 104) == "h"
+
+
+def test_generation_config_supplies_all_end_of_sequence_ids() -> None:
+    processor = TokenizerInputProcessor(FakeTokenizer(), generation_eos=[9, 10])
+    assert processor.eos_token_ids == frozenset({9, 10})

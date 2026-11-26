@@ -8,10 +8,10 @@ from types import MappingProxyType
 from typing import Any
 
 from .communication import (
-    CollectiveGroup,
     SingletonCollectiveGroup,
     TorchDistributedCollectiveGroup,
 )
+from .protocol import CollectiveGroup
 from .topology import ParallelGroupKind, ParallelTopology, RankCoordinates
 
 
@@ -19,7 +19,7 @@ from .topology import ParallelGroupKind, ParallelTopology, RankCoordinates
 class ParallelContext:
     coordinates: RankCoordinates
     device: Any
-    _groups: Mapping[ParallelGroupKind, CollectiveGroup]
+    groups: Mapping[ParallelGroupKind, CollectiveGroup]
 
     @classmethod
     def create(
@@ -32,7 +32,7 @@ class ParallelContext:
 
     def group(self, kind: ParallelGroupKind) -> CollectiveGroup:
         try:
-            return self._groups[kind]
+            return self.groups[kind]
         except KeyError as error:
             raise RuntimeError(
                 f"parallel group {kind.value} is not initialized"

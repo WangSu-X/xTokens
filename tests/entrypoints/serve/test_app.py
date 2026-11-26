@@ -25,7 +25,8 @@ from x_tokens.engine.protocol import (
 from x_tokens.entrypoints.serve import app as serve_app
 from x_tokens.entrypoints.serve import create_app
 from x_tokens.executor import ModelExecutor
-from x_tokens.executor.protocol import Executor, ModelForwardOutput
+from x_tokens.executor.protocol import Executor
+from x_tokens.worker.model_runner import ModelRunnerOutput
 
 
 class FakeEngine:
@@ -63,14 +64,14 @@ class FakeExecutor(Executor):
     eos_token_ids = frozenset((9,))
     num_gpu_blocks = 256
 
-    def execute_model(self, batch: SchedulerOutput) -> ModelForwardOutput:
-        return ModelForwardOutput()
-
-    def sample_tokens(
-        self, output: ModelForwardOutput, batch: SchedulerOutput
-    ) -> tuple[int, ...]:
-        del output
-        return tuple(9 for _ in range(batch.num_samples))
+    def execute_step(self, batch: SchedulerOutput) -> ModelRunnerOutput:
+        return ModelRunnerOutput(
+            {
+                request.request_id: 9
+                for request in batch.running_requests
+                if request.sampling_params is not None
+            }
+        )
 
 
 def _make_fake_executor(*args: object, **kwargs: object) -> FakeExecutor:

@@ -1,0 +1,9 @@
+model: /root/huggingface/Qwen3.8-27B-FP8
+served_model: Qwen3.8-27B
+gpus: [6, 7]
+max_model_len: 16640
+kv_cache_memory_bytes: 12884901888
+max_num_seqs: 16
+xtokens_prefill_batch_tokens: 4096
+xtokens_prefill_chunk_alignment: 384
+aiperf_version: 0.14.0

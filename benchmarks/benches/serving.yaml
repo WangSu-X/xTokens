@@ -1,0 +1,10 @@
+matrix:
+  input_tokens: [1024, 8192, 16384]
+  output_tokens: [256]
+  concurrency: [4, 8, 16]
+repeats: 3
+requests_per_repeat: 100
+warmup: 4
+seed: 20261122
+request_timeout_seconds: 240
+slo_ms: {}

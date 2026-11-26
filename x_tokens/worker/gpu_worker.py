@@ -21,8 +21,8 @@ from x_tokens.worker.protocol import ModelWorker
 
 from .model_runner import (
     ModelRunner,
-    ModelRunnerInput,
     ModelRunnerOutput,
+    ModelRunnerRequest,
 )
 
 logger = init_logger(__name__)
@@ -51,7 +51,7 @@ class GPUWorker(ModelWorker):
             torch_module = torch
         self.config = config
         self.torch_module = torch_module
-        self.model_runner: ModelRunner | None = None
+        self.model_runner: ModelRunner
         self.initialized = False
 
     def init_device(self) -> None:
@@ -114,7 +114,7 @@ class GPUWorker(ModelWorker):
         )
 
     def load_model(self) -> None:
-        self._runner().load_model()
+        self.model_runner.load_model()
         if (
             self.config.topology.world_size > 1
             and self.torch_module.distributed.is_initialized()
@@ -128,50 +128,31 @@ class GPUWorker(ModelWorker):
             )
             self.torch_module.distributed.barrier(**barrier_kwargs)
 
-    def execute_model(self, inputs: ModelRunnerInput) -> ModelRunnerOutput | None:
-        return self._runner().execute_model(inputs)
-
-    def execute_and_sample(self, inputs: ModelRunnerInput) -> tuple[int, ...] | None:
-        runner = self._runner()
-        combined = getattr(runner, "execute_and_sample", None)
-        if combined is not None:
-            return combined(inputs)
-        output = runner.execute_model(inputs)
-        if self.config.rank != self.config.output_rank:
-            if output is not None:
-                raise RuntimeError("a non-output rank returned a model result")
-            return None
-        if (
-            not isinstance(output, ModelRunnerOutput)
-            or output.step_id != inputs.step_id
-        ):
-            raise RuntimeError("output rank returned an invalid model result")
-        return runner.sample_tokens(inputs.step_id)
+    def execute_and_sample(
+        self, requests: tuple[ModelRunnerRequest, ...]
+    ) -> ModelRunnerOutput | None:
+        self.model_runner.execute_model(requests)
+        if self.config.rank == self.config.output_rank:
+            return self.model_runner.sample_tokens()
+        return None
 
     def get_kv_cache_capacity(self, config: KVCacheConfig) -> int:
-        return self._runner().get_kv_cache_capacity(config)
+        return self.model_runner.get_kv_cache_capacity(config)
 
     def initialize_kv_cache(self, num_blocks: int, block_size: int) -> None:
-        self._runner().initialize_kv_cache(num_blocks, block_size)
-
-    def sample_tokens(self, step_id: int) -> tuple[int, ...] | None:
-        return self._runner().sample_tokens(step_id)
+        self.model_runner.initialize_kv_cache(num_blocks, block_size)
 
     def check_health(self) -> None:
-        self._runner()
+        if not self.initialized:
+            raise RuntimeError("worker model runner is not initialized")
 
     def shutdown(self) -> None:
-        if self.model_runner is not None:
+        if self.initialized:
             self.model_runner.shutdown()
-            self.model_runner = None
+            del self.model_runner
+            self.initialized = False
         if (
             self.config.topology.world_size > 1
             and self.torch_module.distributed.is_initialized()
         ):
             self.torch_module.distributed.destroy_process_group()
-        self.initialized = False
-
-    def _runner(self) -> ModelRunner:
-        if self.model_runner is None:
-            raise RuntimeError("worker model runner is not initialized")
-        return self.model_runner

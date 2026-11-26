@@ -30,16 +30,20 @@ def create_app(config: XTokensConfig | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info(
             "serve engine initializing: served_model=%s model=%s "
-            "max_model_len=%d max_num_seqs=%d",
+            "max_model_len=%d max_num_seqs=%d core_client_mode=%s",
             config.model_config.served_model_name,
             config.model_config.model_name,
             config.model_config.max_model_len,
             config.scheduler_config.max_num_seqs,
+            config.server_config.core_client_mode,
         )
         engine = LLMEngine(config)
         app.state.engine = engine
         app.state.completion_service = CompletionService(engine)
-        app.state.chat_service = ChatCompletionService(engine)
+        processor = getattr(engine, "input_processor", None)
+        app.state.chat_service = ChatCompletionService(
+            engine, tokenizer=getattr(processor, "tokenizer", None)
+        )
 
         health = await engine.health()
         if health.ready:

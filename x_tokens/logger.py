@@ -86,12 +86,12 @@ class NewLineFormatter(logging.Formatter):
         if fmt is None:
             fmt = format
         super().__init__(fmt, datefmt, style, validate, defaults=defaults)
-        self._prefix = prefix
+        self.prefix = prefix
 
     def format(self, record: logging.LogRecord) -> str:
         record = copy.copy(record)
         record.fileinfo = _fileinfo(record)
-        message = f"{self._prefix}{record.getMessage()}"
+        message = f"{self.prefix}{record.getMessage()}"
         record.msg = message
         record.args = ()
         rendered = super().format(record)

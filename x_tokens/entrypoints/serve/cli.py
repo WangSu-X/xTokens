@@ -65,7 +65,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)
     parser.add_argument("--context-parallel-size", type=int, default=1)
-    parser.add_argument("--data-parallel-size", type=int, default=1)
+    parser.add_argument("--data-parallel-size", type=int, choices=(1,), default=1)
     parser.add_argument("--enable-expert-parallel", action="store_true")
     parser.add_argument("--expert-parallel-size", type=int)
     parser.add_argument("--collective-backend", default="nccl")
@@ -86,7 +86,6 @@ def main(argv: list[str] | None = None) -> None:
         args.tensor_parallel_size
         * args.pipeline_parallel_size
         * args.context_parallel_size
-        * args.data_parallel_size
     )
     parallel_devices = args.parallel_device
     if parallel_devices is None:

@@ -154,8 +154,11 @@ class Scheduler:
                 new_blocks = self.cache_manager.allocate_slots(request, count)
             if new_blocks is None:
                 break
-            block_ids = self.cache_manager.get_block_ids(request.request_id)
-            scheduled_requests.append(SchedulerRequest(request, block_ids))
+            scheduled_requests.append(
+                SchedulerRequest.from_engine_core_request(
+                    request, self.cache_manager.get_block_ids(request.request_id), count
+                )
+            )
             num_scheduled_tokens[request.request_id] = count
             budget -= count
 
@@ -181,8 +184,11 @@ class Scheduler:
             self.waiting.popleft()
             request.status = RequestStatus.RUNNING
             self.running[request.request_id] = request
-            block_ids = self.cache_manager.get_block_ids(request.request_id)
-            scheduled_requests.append(SchedulerRequest(request, block_ids))
+            scheduled_requests.append(
+                SchedulerRequest.from_engine_core_request(
+                    request, self.cache_manager.get_block_ids(request.request_id), count
+                )
+            )
             num_scheduled_tokens[request.request_id] = count
             budget -= count
             admitted += 1
@@ -222,30 +228,34 @@ class Scheduler:
     def update_from_output(
         self,
         batch: SchedulerOutput,
-        token_ids: tuple[int, ...],
+        sampled_token_ids: dict[str, int],
         *,
         eos_token_ids: frozenset[int],
     ) -> tuple[SchedulerUpdate, ...]:
-        if batch.num_samples != len(token_ids):
-            raise ValueError("batch size and token output size differ")
+        expected_request_ids = {
+            item.request_id
+            for item in batch.running_requests
+            if item.sampling_params is not None
+        }
+        if sampled_token_ids.keys() != expected_request_ids:
+            raise ValueError("sampled request IDs do not match the scheduled requests")
         updates: list[SchedulerUpdate] = []
-        samples = iter(token_ids)
         for item in batch.running_requests:
-            request = item.request
-            count = batch.num_scheduled_tokens[item.request_id]
-            token_id = next(samples) if count == request.num_uncomputed_tokens else None
-            if self.running.get(request.request_id) is not request:
-                continue
-            num_computed_tokens = request.num_computed_tokens + count
+            request = self.running[item.request_id]
+            scheduled_tokens = batch.num_scheduled_tokens[item.request_id]
+            num_computed_tokens = request.num_computed_tokens + scheduled_tokens
             self.cache_manager.cache_blocks(request, num_computed_tokens)
             request.num_computed_tokens = num_computed_tokens
-            if token_id is None:
+
+            sampling_params = item.sampling_params
+            if sampling_params is None:
                 continue
+            token_id = sampled_token_ids[item.request_id]
             request.output_token_ids.append(token_id)
-            if token_id in eos_token_ids and not request.sampling_params.ignore_eos:
+            if token_id in eos_token_ids and not sampling_params.ignore_eos:
                 request.stop_reason = FinishReason.STOP
             elif (
-                request.completion_tokens >= request.sampling_params.max_tokens
+                request.completion_tokens >= sampling_params.max_tokens
                 or request.prompt_tokens + request.completion_tokens
                 >= self.max_model_len
             ):
@@ -268,13 +278,11 @@ class Scheduler:
     def fail_batch(self, batch: SchedulerOutput) -> tuple[EngineCoreRequest, ...]:
         failed: list[EngineCoreRequest] = []
         for item in batch.running_requests:
-            request = item.request
-            if self.running.get(request.request_id) is request:
-                request.status = RequestStatus.FINISHED
-                self.running.pop(request.request_id)
-                self.request_ids.discard(request.request_id)
-                self.cache_manager.free(request.request_id)
-                failed.append(request)
+            request = self.running.pop(item.request_id)
+            request.status = RequestStatus.FINISHED
+            self.request_ids.discard(item.request_id)
+            self.cache_manager.free(item.request_id)
+            failed.append(request)
         return tuple(failed)
 
     def abort_all(self) -> tuple[EngineCoreRequest, ...]:

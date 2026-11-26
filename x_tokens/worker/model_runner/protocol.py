@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from x_tokens.config import KVCacheConfig
@@ -17,21 +17,18 @@ class SamplingMetadata:
 
 @dataclass(frozen=True, slots=True)
 class ModelRunnerRequest:
-    token_ids: tuple[int, ...]
+    request_id: str
+    scheduled_token_ids: tuple[int, ...]
     num_computed_tokens: int
     block_ids: tuple[int, ...]
     sampling_metadata: SamplingMetadata | None
 
 
 @dataclass(frozen=True, slots=True)
-class ModelRunnerInput:
-    step_id: int
-    requests: tuple[ModelRunnerRequest, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class ModelRunnerOutput:
-    step_id: int
+    """Sampled tokens keyed by the request that produced each token."""
+
+    sampled_token_ids: dict[str, int] = field(default_factory=dict)
 
 
 class ModelRunner(Protocol):
@@ -41,8 +38,8 @@ class ModelRunner(Protocol):
 
     def initialize_kv_cache(self, num_blocks: int, block_size: int) -> None: ...
 
-    def execute_model(self, inputs: ModelRunnerInput) -> ModelRunnerOutput | None: ...
+    def execute_model(self, requests: tuple[ModelRunnerRequest, ...]) -> None: ...
 
-    def sample_tokens(self, step_id: int) -> tuple[int, ...] | None: ...
+    def sample_tokens(self) -> ModelRunnerOutput: ...
 
     def shutdown(self) -> None: ...

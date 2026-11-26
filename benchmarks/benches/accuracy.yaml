@@ -1,0 +1,8 @@
+dataset: openai/gsm8k
+split: main/test
+sampling:
+  temperature: 0
+  max_tokens: 1024
+fewshot: 5
+seed: 42
+concurrency: [1, 16]

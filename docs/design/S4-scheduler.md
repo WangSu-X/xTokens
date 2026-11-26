@@ -10,7 +10,7 @@ Scheduler 按请求的未计算 token 数分配每步预算。每步先处理 ru
 
 ## 调度结果
 
-`SchedulerRequest` 引用原有的 `EngineCoreRequest`，并携带 `KVCacheManager.get_block_ids()` 返回的有序 `block_ids`。`SchedulerOutput.running_requests` 包含本步实际执行的请求，`num_scheduled_tokens` 以请求 ID 为键记录每个 chunk 的 token 数。两个类型定义在 `x_tokens/core/protocol.py`。
+`SchedulerRequest.from_engine_core_request()` 将请求 ID、本步 token IDs、起始位置、有序 `block_ids` 和可选采样参数填入调度请求。`SchedulerOutput.running_requests` 包含本步实际执行的请求，`num_scheduled_tokens` 以请求 ID 为键记录每个 chunk 的 token 数。两个类型定义在 `x_tokens/core/protocol.py`。
 
 ```mermaid
 flowchart LR
@@ -27,8 +27,8 @@ flowchart LR
 1. 初始化本步 token 预算和调度结果。按 running 队列顺序为每个请求取 `num_uncomputed_tokens`，计算本步可执行的 token 数。
 2. 请求 KV cache 为本步结束位置分配 block。容量不足时，释放 running 队尾请求持有的 block，将被抢占的请求放回 waiting，清空其计算进度和前缀 hash，再重试当前请求。被抢占请求已生成的 token 保留。
 3. 本步未发生抢占时，在预算和 `max_num_seqs` 允许的范围内处理 waiting。先查 APC 命中的完整 block，再为未计算部分分配预算。只有 KV 分配成功才移动请求到 running。
-4. `ModelExecutor` 从 `num_computed_tokens` 起取本步 token，连同 block IDs 发给 Runner。Runner 用 token 的逻辑位置索引 block IDs，再以 `block_id * block_size + offset` 得到 slot。
-5. forward 成功后，Scheduler 计算新的进度，通过 `KVCacheManager.cache_blocks()` 登记新完成的 APC block，再写回请求进度。只有本步覆盖该请求全部待计算 token 时才采样。
+4. Scheduler 从 `num_computed_tokens` 起截取本步 token。Executor 从 `SchedulerRequest` 读取本步 token 和 block IDs 并发给 Runner。Runner 用 token 的逻辑位置索引 block IDs，再以 `block_id * block_size + offset` 得到 slot。
+5. forward 成功后，Scheduler 按请求 ID 从 running 队列取出原请求。通过 `KVCacheManager.cache_blocks()` 登记新完成的 APC block，再写回请求进度。只有本步覆盖该请求全部待计算 token 时才采样。
 
 ## 兼容性与配置
 

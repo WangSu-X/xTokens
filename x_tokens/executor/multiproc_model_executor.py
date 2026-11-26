@@ -10,7 +10,7 @@ from multiprocessing.connection import Connection
 
 from x_tokens.worker import GPUWorker, GPUWorkerConfig
 
-from .model_executor import ModelExecutor, RunnerGroup
+from .model_executor import ModelExecutor
 from .worker_handle import ProcessWorkerHandle
 
 
@@ -20,17 +20,16 @@ class MultiprocModelExecutor(ModelExecutor):
             raise ValueError("MultiprocModelExecutor requires the mp backend")
         context = multiprocessing.get_context("spawn")
         init_method = f"tcp://127.0.0.1:{_free_port()}"
-        spec = self.topology.runner_group_specs[0]
         handles: list[ProcessWorkerHandle] = []
         try:
-            for rank in spec.ranks:
+            for rank in range(self.topology.world_size):
                 parent_connection, child_connection = context.Pipe()
                 worker_config = GPUWorkerConfig(
                     xtokens_config=self.config,
                     topology=self.topology,
                     rank=rank,
                     distributed_init_method=init_method,
-                    output_rank=spec.output_rank,
+                    output_rank=self.output_rank,
                     pad_token_id=self.pad_token_id,
                 )
                 process = context.Process(
@@ -49,7 +48,7 @@ class MultiprocModelExecutor(ModelExecutor):
                     raise RuntimeError(
                         f"worker rank {handle.rank} failed during startup:\n{payload}"
                     )
-            self.runner_groups = (RunnerGroup(spec, tuple(handles)),)
+            self.worker_handles = tuple(handles)
         except Exception:
             _terminate(handles)
             raise
@@ -57,8 +56,7 @@ class MultiprocModelExecutor(ModelExecutor):
     def shutdown(self) -> None:
         handles = [
             handle
-            for group in self.runner_groups
-            for handle in group.worker_handles
+            for handle in self.worker_handles
             if isinstance(handle, ProcessWorkerHandle)
         ]
         if not handles:
@@ -74,7 +72,7 @@ class MultiprocModelExecutor(ModelExecutor):
             for handle in handles:
                 handle.process.join(timeout=1)
             _terminate(handles)
-            self.runner_groups = ()
+            self.worker_handles = ()
 
 
 def _worker_entry(

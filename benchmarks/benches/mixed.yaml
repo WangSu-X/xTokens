@@ -1,0 +1,2 @@
+input_cycle: [1024, 8192, 16384]
+concurrency: [8]

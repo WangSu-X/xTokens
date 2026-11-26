@@ -52,10 +52,10 @@ entrypoints/serve/
 
 engine/
 ├── llm_engine.py               # LLMEngine：统一的文本生成接口
-├── protocol.py                 # GenerateRequest, EngineEvent 等类型定义
-├── input_processor.py          # InputProcessor 协议和 TokenizerInputProcessor 实现
-├── output_processor.py         # OutputProcessor 协议和 TokenizerOutputProcessor 实现
-└── core_client.py              # EngineCoreClient：与 EngineCore 通信
+├── protocol.py                 # GenerateRequest、EngineEvent、EngineCoreClient 等接口与数据结构
+├── input_processor.py          # TokenizerInputProcessor 实现
+├── output_processor.py         # TokenizerOutputProcessor 实现
+└── core_client.py              # EngineCoreClient 的进程内和多进程实现
 ```
 
 | 模块 | 职责 |
@@ -88,7 +88,7 @@ sequenceDiagram
     Service->>Service: 验证参数、生成 request_id
     Service->>Service: prompt + sampling → GenerateRequest
     Service->>Engine: await generate(GenerateRequest)
-    Engine->>Engine: 注册 request_outputs 队列
+    Engine->>Engine: 注册 request_output_queue
     Engine->>Engine: 启动 _read_core_outputs() 任务
     Engine->>InputProc: 分词 (同步)
     Engine->>CoreClient: add_request(ProcessedRequest)
@@ -97,7 +97,7 @@ sequenceDiagram
     Note over CoreClient,OutputTask: Core 执行一步
     
     OutputTask->>CoreClient: get_output()
-    CoreClient-->>OutputTask: CoreEvent 批次
+    CoreClient-->>OutputTask: CoreRequestOutput 批次
     OutputTask->>CoreOutput: 按 request_id put_nowait(event)
     
     CoreOutput-->>Engine: await queue.get() 返回 event
@@ -107,7 +107,7 @@ sequenceDiagram
     Service-->>Client: 格式化为 JSON 或 SSE
     
     Engine->>Engine: 重复至 CoreFinishedEvent
-    Engine->>Engine: 清理 request_outputs[request_id]
+    Engine->>Engine: 清理 request_output_queues[request_id]
     Engine->>OutputProc: finish(request_id)
 ```
 
@@ -119,10 +119,10 @@ class LLMEngine:
         """
         文本生成的稳定接口。
         流程：
-        1. 创建 request_outputs 队列，启动 _read_core_outputs() 任务
+        1. 创建 request_output_queue，启动 _read_core_outputs() 任务
         2. 对 prompt 分词得到 ProcessedRequest
         3. 通过 EngineCoreClient 提交
-        4. 等待队列中的 CoreEvent，转换为 EngineEvent
+        4. 等待队列中的 CoreRequestOutput，转换为 EngineEvent
         5. 收到 CoreFinishedEvent 或 CoreErrorEvent 后结束
         6. 异常时尝试 abort_requests()
         7. 清理队列和 OutputProcessor 状态
@@ -135,7 +135,7 @@ class LLMEngine:
         异常时唤醒所有活跃请求的队列。
         """
         
-    def parse_output(event: CoreEvent) -> EngineEvent:
+    def parse_output(request_output: CoreRequestOutput) -> EngineEvent:
         """
         将 Core 的 CoreTokenEvent / CoreFinishedEvent / CoreErrorEvent
         转换为 API 层的 TokenEvent / FinishedEvent / ErrorEvent。
@@ -230,7 +230,7 @@ flowchart TD
 - `host`、`port`：监听地址。
 - `api_key`：可选，若设置则需要 Bearer token。
 - `served_model_name`：模型别名，用于 `/v1/models` 和请求验证。
-- `core_client_mode`：`"in_proc"`（默认）或 `"multi_proc"`。
+- `core_client_mode` 默认使用 `"multi_proc"`。CLI 可以通过 `--engine inproc` 选择 `"in_proc"`。
 
 ### 错误与清理
 
