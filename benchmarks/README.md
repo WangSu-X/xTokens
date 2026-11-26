@@ -12,7 +12,7 @@
 在仓库根目录安装 benchmark 依赖并准备数据。需要已有的本地模型和 tokenizer，可用 `--model` 指定。下载 SPEED-Bench 时可通过 `--mirror` 指定 Hugging Face 镜像。
 
 ```bash
-uv sync --locked --group benchmark
+uv sync --locked --group benchmark --group cuda
 source .venv/bin/activate
 python -m benchmarks.scripts.run prepare
 python -m benchmarks.scripts.run all --gpus 6,7 --output benchmarks/results/baseline

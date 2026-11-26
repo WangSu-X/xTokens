@@ -44,19 +44,18 @@ def record(operation, details, call, *args, **kwargs):
 
 def install_xtokens(module):
     owner = module.GPUModelRunner
-    forward = owner._forward
+    execute_model = owner.execute_model
     sample = owner.sample_tokens
 
-    @functools.wraps(forward)
-    def timed_forward(self, inputs, **kwargs):
+    @functools.wraps(execute_model)
+    def timed_execute_model(self, requests):
         details = control() if self.is_output_rank else None
         if details is None:
-            return forward(self, inputs, **kwargs)
-        requests = inputs.requests
+            return execute_model(self, requests)
         details.update(
-            query_tokens=sum(len(request.token_ids) for request in requests),
+            query_tokens=sum(len(request.scheduled_token_ids) for request in requests),
             context_tokens=[
-                request.num_computed_tokens + len(request.token_ids)
+                request.num_computed_tokens + len(request.scheduled_token_ids)
                 for request in requests
             ],
             is_prefill=any(
@@ -65,20 +64,22 @@ def install_xtokens(module):
             ),
         )
         if details["is_prefill"]:
-            details["actual_prompt_tokens"] = list(requests[0].token_ids)
+            details["actual_prompt_tokens"] = list(requests[0].scheduled_token_ids)
         else:
-            details["actual_decode_tokens"] = list(requests[0].token_ids)
-        return record("forward_with_head", details, forward, self, inputs, **kwargs)
+            details["actual_decode_tokens"] = list(requests[0].scheduled_token_ids)
+        return record("forward_with_head", details, execute_model, self, requests)
 
     @functools.wraps(sample)
-    def fixed_sample(self, step_id):
-        result = sample(self, step_id)
+    def fixed_sample(self):
+        result = sample(self)
         details = control() if self.is_output_rank else None
-        if details is not None and result is not None:
-            return (details["decode_token"],) * len(result)
+        if details is not None:
+            return module.ModelRunnerOutput(
+                dict.fromkeys(result.sampled_token_ids, details["decode_token"])
+            )
         return result
 
-    owner._forward = timed_forward
+    owner.execute_model = timed_execute_model
     owner.sample_tokens = fixed_sample
 
 

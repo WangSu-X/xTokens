@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from itertools import accumulate
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -169,6 +171,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.A_log = nn.Parameter(torch.empty(self.num_value_heads, **tensor_options))
         self.dt_bias = nn.Parameter(torch.empty(self.num_value_heads, **tensor_options))
         self.norm = RMSNorm(self.value_head_dim, eps=self.eps, **tensor_options)
+        self.flash_chunk = None
+        self.flash_recurrent = None
+        if linear_options["device"].type == "cuda":
+            from fla.ops.gated_delta_rule import (
+                chunk_gated_delta_rule,
+                fused_recurrent_gated_delta_rule,
+            )
+
+            self.flash_chunk = chunk_gated_delta_rule
+            self.flash_recurrent = fused_recurrent_gated_delta_rule
 
     def forward(
         self,
@@ -227,29 +239,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             .split((self.key_width, self.key_width, self.value_width), dim=-1)
         )
         repetitions = self.num_value_heads // self.num_key_heads
-        query = query.reshape(-1, self.num_key_heads, self.key_head_dim).transpose(0, 1)
-        key = key.reshape(-1, self.num_key_heads, self.key_head_dim).transpose(0, 1)
-        value = value.reshape(-1, self.num_value_heads, self.value_head_dim).transpose(
-            0, 1
-        )
-        query = query.repeat_interleave(repetitions, dim=0).float()
-        key = key.repeat_interleave(repetitions, dim=0).float()
-        value = value.float()
-        beta, log_decay = beta.transpose(0, 1), log_decay.transpose(0, 1)
+        query = query.unflatten(-1, (self.num_key_heads, self.key_head_dim))
+        key = key.unflatten(-1, (self.num_key_heads, self.key_head_dim))
+        value = value.unflatten(-1, (self.num_value_heads, self.value_head_dim))
+        query = query.repeat_interleave(repetitions, dim=1)
+        key = key.repeat_interleave(repetitions, dim=1)
 
         outputs = []
         offset = 0
         while offset < metadata.query_len:
             position = start + offset
             block_index, block_offset = divmod(position, block_size)
-            end = min(metadata.query_len, offset + min(64, block_size - block_offset))
+            span_len = block_size - block_offset
+            if self.flash_chunk is None:
+                span_len = min(64, span_len)
+            end = min(metadata.query_len, offset + span_len)
             span = slice(offset, end)
             output, recurrent = self._gated_delta_rule(
-                query[:, span],
-                key[:, span],
-                value[:, span],
-                log_decay[:, span],
-                beta[:, span],
+                query[span],
+                key[span],
+                value[span],
+                log_decay[span],
+                beta[span],
                 recurrent,
             )
             outputs.append(output)
@@ -261,10 +272,43 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     recurrent,
                 )
             offset = end
-        return torch.cat(outputs, dim=1).transpose(0, 1).to(mixed.dtype)
+        return torch.cat(outputs).to(mixed.dtype)
+
+    def _gated_delta_rule(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        log_decay: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        kernel = self.flash_recurrent if query.shape[0] == 1 else self.flash_chunk
+        if kernel is not None:
+            output, final_state = kernel(
+                query.unsqueeze(0),
+                key.unsqueeze(0),
+                value.unsqueeze(0),
+                g=log_decay.unsqueeze(0),
+                beta=beta.unsqueeze(0),
+                initial_state=state.unsqueeze(0),
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            return output.squeeze(0), final_state.squeeze(0)
+
+        output, final_state = self._torch_gated_delta_rule(
+            query.transpose(0, 1).float(),
+            key.transpose(0, 1).float(),
+            value.transpose(0, 1).float(),
+            log_decay.transpose(0, 1),
+            beta.transpose(0, 1),
+            state,
+        )
+        return output.transpose(0, 1), final_state
 
     @staticmethod
-    def _gated_delta_rule(
+    def _torch_gated_delta_rule(
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -336,6 +380,14 @@ class Qwen3_5Attention(nn.Module):
         }
         self.q_norm = OffsetRMSNorm(self.head_dim, **norm_options)
         self.k_norm = OffsetRMSNorm(self.head_dim, **norm_options)
+        self.flash_attention = None
+        if linear_options["device"].type == "cuda" and linear_options["dtype"] in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            from flash_attn import flash_attn_varlen_func
+
+            self.flash_attention = flash_attn_varlen_func
 
     def _apply_rope(
         self, tensor: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
@@ -357,19 +409,71 @@ class Qwen3_5Attention(nn.Module):
     ) -> torch.Tensor:
         query, key, value, gate = self._project(hidden, cos, sin)
         cache.write(self.cache_layer, metadata, key, value)
-        key, value = cache.gather(self.cache_layer, metadata)
+        if self.flash_attention is not None:
+            key, value = cache.gather_packed(self.cache_layer, metadata)
+            attended = self._flash_attention(query, key, value, metadata)
+        else:
+            key, value = cache.gather(self.cache_layer, metadata)
+            attended = self._torch_attention(query, key, value, positions)
+        return self.o_proj((attended * gate.sigmoid()).flatten(-2))
+
+    def _flash_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        metadata: tuple[KVCacheSlots, ...],
+    ) -> torch.Tensor:
+        query_lengths = [item.query_len for item in metadata]
+        context_lengths = [item.context_len for item in metadata]
+        packed_query = torch.cat(
+            [query[row, -length:] for row, length in enumerate(query_lengths)]
+        )
+        cu_query = torch.tensor(
+            list(accumulate(query_lengths, initial=0)),
+            dtype=torch.int32,
+            device=query.device,
+        )
+        cu_context = torch.tensor(
+            list(accumulate(context_lengths, initial=0)),
+            dtype=torch.int32,
+            device=query.device,
+        )
+        # The query chunk is the suffix of its KV context, matching FlashAttention's
+        # bottom-right causal alignment.
+        packed_output = self.flash_attention(
+            packed_query,
+            key,
+            value,
+            cu_query,
+            cu_context,
+            max(query_lengths),
+            max(context_lengths),
+            causal=True,
+        )
+        output = torch.zeros_like(query)
+        for row, chunk in enumerate(packed_output.split(query_lengths)):
+            output[row, -chunk.shape[0] :] = chunk
+        return output
+
+    def _torch_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
         repetitions = self.num_heads // self.num_kv_heads
         key = key.transpose(1, 2).repeat_interleave(repetitions, dim=1)
         value = value.transpose(1, 2).repeat_interleave(repetitions, dim=1)
         # Real query positions are always less than their request's context length.
         # Padded query rows are discarded by the cache writer and output head.
-        key_positions = torch.arange(key.shape[-2], device=hidden.device)
+        key_positions = torch.arange(key.shape[-2], device=query.device)
         allowed = key_positions <= positions[:, None, :, None]
         output = F.scaled_dot_product_attention(
             query.transpose(1, 2), key, value, attn_mask=allowed, dropout_p=0.0
         )
-        gated = output.transpose(1, 2) * gate.sigmoid()
-        return self.o_proj(gated.flatten(-2))
+        return output.transpose(1, 2)
 
     def _project(
         self, hidden: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor

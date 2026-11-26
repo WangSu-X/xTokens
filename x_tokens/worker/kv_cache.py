@@ -145,6 +145,22 @@ class GPUKVCache:
             )[: item.context_len]
         return key, value
 
+    def gather_packed(
+        self,
+        layer_index: int,
+        metadata: tuple[KVCacheSlots, ...],
+    ) -> tuple[Any, Any]:
+        layer_cache = self.storage[layer_index]
+        contexts = []
+        for item in metadata:
+            block_ids = self.torch_module.tensor(
+                item.block_ids, dtype=self.torch_module.long, device=layer_cache.device
+            )
+            blocks = layer_cache.index_select(1, block_ids)
+            contexts.append(blocks.flatten(1, 2)[:, : item.context_len])
+        key, value = self.torch_module.cat(contexts, dim=1).unbind(0)
+        return key, value
+
     def clear(self) -> None:
         self.storage.zero_()
         if self.conv_states is not None:

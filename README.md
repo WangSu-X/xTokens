@@ -10,7 +10,7 @@
 - 执行层只保留项目的 `Executor` / `ModelExecutor` 抽象，支持 uni/mp 执行和 TP。
 - KV cache 为必需能力，支持分块存储、prefix reuse、释放和抢占后的重算。
 - 支持 Qwen3.5 混合注意力文本模型，包括 Qwen3.8-27B。
-- 全注意力使用 PyTorch SDPA，Gated DeltaNet 使用 xTokens 的 PyTorch 实现。
+- CUDA FP16/BF16 全注意力使用 FlashAttention 2，CUDA Gated DeltaNet 使用 Flash Linear Attention。CPU 使用 PyTorch 实现。
 
 ## 环境与验证
 
@@ -22,6 +22,14 @@ source .venv/bin/activate
 uv run pytest -q tests
 uv run ruff check x_tokens tests
 ```
+
+CUDA FP16/BF16 推理需要 Ampere 或更新的 NVIDIA GPU。Linux x86-64、Python 3.12 使用与项目 PyTorch 2.5 匹配的 FlashAttention wheel。
+
+```bash
+uv sync --locked --group cuda
+```
+
+从源码构建 FlashAttention 时，先同步基础依赖，再用 `uv pip install wheel ninja` 安装构建工具，并为同步命令加上 `--no-build-isolation-package flash-attn`。源码构建需要 CUDA toolkit。
 
 需要在 xTokens 的同一个虚拟环境中运行 AIPerf 时，启用可选的 `benchmark` 依赖组。
 
@@ -35,7 +43,7 @@ uv run --locked --group benchmark aiperf --version
 `--model` 为模型目录或 Hub ID；`--served-model-name` 为 API 名称，默认等于 `--model`。
 
 ```bash
-uv run python -m x_tokens \
+uv run --locked --group cuda python -m x_tokens \
   --model /path/to/Qwen3.8-27B-FP8 \
   --served-model-name Qwen3.8-27B \
   --dtype bfloat16 \

@@ -87,17 +87,33 @@ def save_checkpoint(
     save_file(parameters, path / "model.safetensors")
 
 
-@pytest.mark.parametrize("conditional", [False, True], ids=["text", "conditional"])
+@pytest.mark.parametrize(
+    ("conditional", "device", "dtype"),
+    [
+        pytest.param(False, "cpu", "float32", id="text"),
+        pytest.param(True, "cpu", "float32", id="conditional"),
+        pytest.param(True, "cuda:0", "bfloat16", id="cuda-bf16"),
+    ],
+)
 def test_hybrid_prefill_apc_and_decode_match_transformers(
-    tmp_path: Path, tiny_qwen3_5: Qwen3_5ForCausalLM, conditional: bool
+    tmp_path: Path,
+    tiny_qwen3_5: Qwen3_5ForCausalLM,
+    conditional: bool,
+    device: str,
+    dtype: str,
 ) -> None:
+    if device.startswith("cuda"):
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] < 8:
+            pytest.skip("FlashAttention requires an Ampere or newer CUDA GPU")
+        pytest.importorskip("flash_attn")
+        pytest.importorskip("fla.ops.gated_delta_rule")
     hf_model = tiny_qwen3_5
     save_checkpoint(tmp_path, hf_model, conditional=conditional)
 
-    parallel = ParallelConfig(devices=("cpu",), collective_backend="gloo")
+    parallel = ParallelConfig(devices=(device,), collective_backend="gloo")
     config = XTokensConfig(
         model_config=ModelConfig(model=str(tmp_path)),
-        executor_config=ExecutorConfig(dtype="float32", local_files_only=True),
+        executor_config=ExecutorConfig(dtype=dtype, local_files_only=True),
         parallel_config=parallel,
     )
     worker = GPUWorker(
@@ -126,6 +142,10 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
     assert isinstance(full_layer, Qwen3_5DecoderLayer)
     assert isinstance(linear_layer.linear_attn, Qwen3_5GatedDeltaNet)
     assert isinstance(full_layer.self_attn, Qwen3_5Attention)
+    if dtype == "bfloat16":
+        assert linear_layer.linear_attn.flash_chunk is not None
+        assert linear_layer.linear_attn.flash_recurrent is not None
+        assert full_layer.self_attn.flash_attention is not None
     assert all(isinstance(layer.mlp, Qwen3_5MLP) for layer in model.model.layers)
     cache_config = KVCacheConfig(block_size=4, num_gpu_blocks=8)
     manager = KVCacheManager(
@@ -169,7 +189,10 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
                 use_cache=False,
                 logits_to_keep=1,
             ).logits[0, 0]
-            torch.testing.assert_close(actual[index], expected, atol=2e-5, rtol=2e-5)
+            tolerance = 5e-3 if dtype == "bfloat16" else 2e-5
+            torch.testing.assert_close(
+                actual[index].float().cpu(), expected, atol=tolerance, rtol=tolerance
+            )
             end = len(request.all_token_ids)
             manager.cache_blocks(request, end)
             request.num_computed_tokens = end
