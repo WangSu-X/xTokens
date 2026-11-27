@@ -17,7 +17,7 @@ Qwen3.5 的全注意力和线性注意力使用同一套 block IDs。全注意�
 
 ## 非目标
 
-本次重构的范围是单个 EngineCore 的逻辑 KV 管理。GPU 存储布局和模型的注意力计算由 `GPUKVCache` 与模型层管理。
+本文关注单个 EngineCore 的逻辑 KV 管理。Runner 按模型声明的逐层规格分配 GPU 缓存，注意力层负责读写。
 
 ## 设计概述
 
@@ -104,7 +104,7 @@ sequenceDiagram
     participant B as BlockPool
     participant X as ModelExecutor
     participant M as GPUModelRunner
-    participant G as GPUKVCache
+    participant G as Qwen3_5ForCausalLM
 
     loop Running requests
         S->>K: allocate_slots(request, num_new_tokens)
@@ -126,8 +126,10 @@ sequenceDiagram
     end
 
     S->>X: SchedulerOutput
-    X->>M: ModelRunnerInput
-    M->>G: Write K/V and linear attention state
+    X->>M: ModelRunnerRequest batch
+    M->>M: Set ForwardContext
+    M->>G: input_ids and position_ids
+    G->>G: Read and write rank-local cache
     M-->>X: ModelRunnerOutput
     X-->>S: Sampled token IDs
 

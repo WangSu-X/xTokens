@@ -13,13 +13,12 @@ from x_tokens.executor import (
     MultiprocModelExecutor,
     UniProcModelExecutor,
 )
-from x_tokens.kv_cache import KVCacheSpec
-from x_tokens.modeling import ModelInput, ModelOutput
+from x_tokens.modeling import ModelOutput
+from x_tokens.modeling.kv_cache import FullAttentionCacheSpec
 from x_tokens.worker import GPUWorker
 from x_tokens.worker.model_runner import (
     GPUModelRunner,
     ModelRunnerOutput,
-    ModelRunnerRequest,
 )
 
 
@@ -28,24 +27,21 @@ class TinyNextTokenModel(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.anchor = nn.Parameter(torch.zeros(()))
-        self.kv_cache = None
 
-    def forward(self, inputs: ModelInput) -> ModelOutput:
-        assert inputs.input_ids is not None
-        next_tokens = (inputs.input_ids[:, -1] + 1) % self.vocab_size
+    def forward(
+        self, input_ids: torch.Tensor, position_ids: torch.Tensor
+    ) -> ModelOutput:
+        next_tokens = (input_ids[:, -1] + 1) % self.vocab_size
         logits = torch.full(
-            (inputs.input_ids.shape[0], self.vocab_size),
+            (input_ids.shape[0], self.vocab_size),
             -1000.0,
-            device=inputs.input_ids.device,
+            device=input_ids.device,
         )
         logits.scatter_(1, next_tokens.unsqueeze(1), 1000.0)
         return ModelOutput(logits)
 
-    def get_kv_cache_spec(self, block_size: int) -> KVCacheSpec:
-        return KVCacheSpec(1, block_size, 1, 1, self.anchor.element_size())
-
-    def set_kv_cache(self, kv_cache: object | None) -> None:
-        self.kv_cache = kv_cache
+    def get_kv_cache_specs(self, block_size: int) -> dict[str, FullAttentionCacheSpec]:
+        return {"attn": FullAttentionCacheSpec(block_size, 1, 1, self.anchor.dtype)}
 
 
 @pytest.fixture
@@ -193,5 +189,7 @@ def test_executor_rejects_reserved_parallel_execution_modes() -> None:
         ),
         kv_cache_config=cache_config(),
     )
-    with pytest.raises(NotImplementedError, match="pipeline parallelism is not supported"):
+    with pytest.raises(
+        NotImplementedError, match="pipeline parallelism is not supported"
+    ):
         MultiprocModelExecutor(config, pad_token_id=0)

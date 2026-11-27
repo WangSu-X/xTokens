@@ -6,21 +6,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
+from torch import Tensor
+
 from x_tokens.distributed import ParallelContext, ParallelGroupKind
-from x_tokens.kv_cache import KVCacheSlots
 
 from .config import ModelLoadConfig
+from .kv_cache import KVCacheSpec
 
 if TYPE_CHECKING:
     from x_tokens.worker.model_runner.protocol import ModelRunner
-
-
-@dataclass(frozen=True, slots=True)
-class ModelInput:
-    input_ids: Any | None
-    attention_mask: Any
-    position_ids: Any
-    kv_cache_slots: tuple[KVCacheSlots, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,10 +43,12 @@ class ParameterShardSpec:
 
 
 class XTokensModel(Protocol):
+    def get_kv_cache_specs(self, block_size: int) -> Mapping[str, KVCacheSpec]: ...
+
     def __call__(
         self,
-        inputs: ModelInput,
-        intermediate_tensors: IntermediateTensors | None = None,
+        input_ids: Tensor,
+        position_ids: Tensor,
     ) -> ModelOutput: ...
 
 

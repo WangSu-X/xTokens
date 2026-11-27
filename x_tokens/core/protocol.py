@@ -14,6 +14,7 @@ class SchedulerRequest:
     num_computed_tokens: int
     block_ids: tuple[int, ...]
     sampling_params: SamplingParams | None
+    is_prefill: bool = True
 
     @classmethod
     def from_engine_core_request(
@@ -35,6 +36,7 @@ class SchedulerRequest:
                 if num_scheduled_tokens == request.num_uncomputed_tokens
                 else None
             ),
+            is_prefill=request.needs_prefill or num_scheduled_tokens != 1,
         )
 
 

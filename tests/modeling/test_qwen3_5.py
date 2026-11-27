@@ -151,9 +151,13 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
     manager = KVCacheManager(
         cache_config, num_blocks=8, max_model_len=16, model_fingerprint="test"
     )
-    spec = model.get_kv_cache_spec(cache_config.block_size)
+    specs = model.get_kv_cache_specs(cache_config.block_size)
     runner.initialize_kv_cache(num_blocks=8, block_size=cache_config.block_size)
-    assert runner.kv_cache.allocated_bytes == 8 * spec.bytes_per_block
+    assert (
+        runner.kv_cache_dict.keys()
+        == specs.keys()
+        == {"model.layers.0.linear_attn", "model.layers.1.self_attn"}
+    )
 
     @torch.inference_mode()
     def compare(requests: tuple[EngineCoreRequest, ...]) -> None:
@@ -179,6 +183,7 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
                     num_computed_tokens=request.num_computed_tokens,
                     block_ids=block_ids,
                     sampling_metadata=SamplingMetadata(0, 1, None),
+                    is_prefill=request.needs_prefill or count != 1,
                 )
             )
         runner.execute_model(tuple(runner_requests))
@@ -200,7 +205,20 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
 
     prompt = (1, 2, 3, 4, 5, 6, 7, 8, 9)
     cold = EngineCoreRequest("cold", SamplingParams(), prompt)
-    compare((cold,))
+    short = EngineCoreRequest("short", SamplingParams(), (25, 26, 27, 28, 29))
+    if dtype == "bfloat16":
+        gdn = linear_layer.linear_attn
+        with patch.object(gdn, "flash_chunk", wraps=gdn.flash_chunk) as flash_chunk:
+            compare((cold, short))
+        first, second, last = flash_chunk.call_args_list
+        assert first.args[0].shape[:2] == (2, 4)
+        assert first.kwargs["cu_seqlens"] is None
+        assert second.kwargs["cu_seqlens"].tolist() == [0, 4, 5]
+        assert last.args[0].shape[:2] == (1, 1)
+        assert last.kwargs["cu_seqlens"] is None
+    else:
+        compare((cold, short))
+    manager.free("short")
     manager.free("cold")
 
     warm = EngineCoreRequest("warm", SamplingParams(), prompt)
@@ -215,7 +233,9 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
     manager.free("other")
 
     chunked = EngineCoreRequest("chunked", SamplingParams(), (17, 18, 19, 20, 21))
+    extra = EngineCoreRequest("extra", SamplingParams(), (28, 30, 31))
     assert manager.allocate_slots(chunked, 3) is not None
+    assert manager.allocate_slots(extra, 2) is not None
     first_chunk = manager.get_block_ids(chunked.request_id)
     warm.output_token_ids.append(12)
     assert manager.allocate_slots(warm, 1) is not None
@@ -232,6 +252,14 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
                 warm.num_computed_tokens,
                 warm_decode,
                 greedy,
+                is_prefill=False,
+            ),
+            ModelRunnerRequest(
+                "extra",
+                extra.prompt_token_ids[:2],
+                0,
+                manager.get_block_ids(extra.request_id),
+                None,
             ),
         )
     )
@@ -248,9 +276,13 @@ def test_hybrid_prefill_apc_and_decode_match_transformers(
     assert runner.sample_tokens().sampled_token_ids == {"warm": expected}
     manager.cache_blocks(chunked, 3)
     chunked.num_computed_tokens = 3
+    manager.cache_blocks(extra, 2)
+    extra.num_computed_tokens = 2
     manager.cache_blocks(warm, len(warm.all_token_ids))
     warm.num_computed_tokens = len(warm.all_token_ids)
-    compare((chunked,))
+    compare((chunked, extra))
+    warm.output_token_ids.append(13)
+    compare((warm,))
     worker.shutdown()
 
 

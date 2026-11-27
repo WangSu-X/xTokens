@@ -1,30 +1,47 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
-from x_tokens.kv_cache import KVCacheSlots, KVCacheSpec
-from x_tokens.worker import GPUKVCache
+from x_tokens.modeling.kv_cache import (
+    ForwardContext,
+    FullAttentionCacheSpec,
+    LinearAttentionCacheSpec,
+    get_forward_context,
+    set_forward_context,
+)
+from x_tokens.worker.kv_cache import allocate_kv_cache
 
 
-def test_gpu_kv_cache_writes_slots_and_gathers_logical_block_order() -> None:
-    cache = GPUKVCache(
-        KVCacheSpec(1, 2, 1, 2, 4),
-        num_blocks=3,
-        device="cpu",
-        dtype=torch.float32,
-    )
-    metadata = (
-        KVCacheSlots(
-            context_len=3,
-            block_ids=(2, 0),
-            slot_mapping=(4, 5, 0),
-        ),
-    )
-    key = torch.tensor([[[[1.0, 2.0]], [[3.0, 4.0]], [[5.0, 6.0]]]])
-    value = key + 10
+def test_cache_allocation_matches_per_layer_specs() -> None:
+    specs = {
+        "full": FullAttentionCacheSpec(2, 1, 4, torch.bfloat16),
+        "linear": LinearAttentionCacheSpec(8, 3, 2, 4, 6, torch.bfloat16),
+    }
+    caches = allocate_kv_cache(specs, 3, torch.device("cpu"))
+    full_cache = caches["full"]
+    conv_cache, recurrent_cache = caches["linear"]
+    assert full_cache.shape == (2, 3, 2, 1, 4)
+    assert conv_cache.shape == (3, 8, 3)
+    assert recurrent_cache.shape == (3, 2, 4, 6)
+    assert full_cache.dtype == conv_cache.dtype == torch.bfloat16
+    assert recurrent_cache.dtype == torch.float32
+    assert sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in (full_cache, conv_cache, recurrent_cache)
+    ) == 3 * sum(spec.bytes_per_block for spec in specs.values())
 
-    cache.write(0, metadata, key, value)
-    gathered_key, gathered_value = cache.gather(0, metadata)
 
-    assert torch.equal(gathered_key[0, :, 0], key[0, :, 0])
-    assert torch.equal(gathered_value[0, :, 0], value[0, :, 0])
+def test_forward_context_is_restored_on_error() -> None:
+    outer = ForwardContext({}, None, None)
+    inner = ForwardContext({}, None, None)
+    with set_forward_context(outer):
+        with (
+            pytest.raises(RuntimeError, match="failed forward"),
+            set_forward_context(inner),
+        ):
+            assert get_forward_context() is inner
+            raise RuntimeError("failed forward")
+        assert get_forward_context() is outer
+    with pytest.raises(LookupError):
+        get_forward_context()

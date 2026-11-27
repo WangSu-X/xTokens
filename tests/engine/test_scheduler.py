@@ -103,6 +103,11 @@ def test_prefill_batch_budget_counts_only_uncached_tokens() -> None:
         "warm",
         "later",
     ]
+    assert [item.is_prefill for item in next_batch.running_requests] == [
+        False,
+        False,
+        True,
+    ]
 
 
 def test_prefill_batch_budget_defers_oversized_prompt_until_it_can_run_alone() -> None:

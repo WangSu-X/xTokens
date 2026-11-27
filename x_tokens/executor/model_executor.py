@@ -117,6 +117,7 @@ class ModelExecutor(Executor, ABC):
                     num_computed_tokens=item.num_computed_tokens,
                     block_ids=item.block_ids,
                     sampling_metadata=sampling_metadata,
+                    is_prefill=item.is_prefill,
                 )
             )
         responses = self.collective_rpc("execute_and_sample", tuple(requests))

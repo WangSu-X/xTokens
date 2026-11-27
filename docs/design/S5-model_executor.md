@@ -261,7 +261,7 @@ update_from_output(batch, token_ids, eos_ids)
   └─ SchedulerUpdate
 ```
 
-Runner 根据 `ModelRunnerRequest` 中的 token 位置和 block IDs 计算 `slot_mapping`，供每个 rank 的 `GPUKVCache` 读写。
+Runner 根据 `ModelRunnerRequest` 中的 token 位置和 block IDs 构造 `ForwardContext`，并在本次 forward 的作用域内设置它。各注意力层通过 `get_forward_context()` 读取本步元数据，访问 rank 本地的逐层缓存。
 
 ## KV Cache 初始化
 

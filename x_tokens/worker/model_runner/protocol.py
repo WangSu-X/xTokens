@@ -22,6 +22,7 @@ class ModelRunnerRequest:
     num_computed_tokens: int
     block_ids: tuple[int, ...]
     sampling_metadata: SamplingMetadata | None
+    is_prefill: bool = True
 
 
 @dataclass(frozen=True, slots=True)

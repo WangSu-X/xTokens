@@ -3,7 +3,6 @@
 from .config import ModelLoadConfig
 from .protocol import (
     IntermediateTensors,
-    ModelInput,
     ModelOutput,
     ParameterShardSpec,
     TensorShard,
@@ -14,7 +13,6 @@ from .registry import ModelRegistration, ModelRegistry
 
 __all__ = [
     "IntermediateTensors",
-    "ModelInput",
     "ModelLoadConfig",
     "ModelOutput",
     "ModelRegistration",
