@@ -10,7 +10,7 @@ import traceback
 from collections.abc import Iterator
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
-from queue import Queue
+from queue import Empty, Queue
 from typing import TYPE_CHECKING
 
 from x_tokens.core.config import EngineCoreConfig
@@ -38,18 +38,17 @@ logger = init_logger(__name__)
 
 @dataclass(slots=True)
 class EngineCoreOutputs:
-    """Outputs produced by one Core step, grouped by output channel."""
+    """Outputs produced by one Core step."""
 
-    outputs: dict[int, list[CoreRequestOutput]] = field(default_factory=dict)
+    outputs: list[CoreRequestOutput] = field(default_factory=list)
 
-    def add(self, request_output: CoreRequestOutput, channel: int = 0) -> None:
-        self.outputs.setdefault(channel, []).append(request_output)
+    def add(self, request_output: CoreRequestOutput) -> None:
+        """Add a request output to this batch."""
+        self.outputs.append(request_output)
 
-    def get(
-        self, channel: int, default: tuple[CoreRequestOutput, ...] = ()
-    ) -> tuple[CoreRequestOutput, ...]:
-        request_outputs = self.outputs.get(channel)
-        return tuple(request_outputs) if request_outputs is not None else default
+    def get(self) -> tuple[CoreRequestOutput, ...]:
+        """Return all outputs as a tuple."""
+        return tuple(self.outputs)
 
 
 class EngineCore:
@@ -86,7 +85,7 @@ class EngineCore:
                 kv_cache_config=kv_cache_config,
                 model_fingerprint=model_config.served_model_name,
             )
-        except BaseException:
+        except Exception:
             self._shutdown_executor(self.executor)
             raise
         self.pending_outputs = EngineCoreOutputs()
@@ -152,18 +151,16 @@ class EngineCore:
             output_ready.result(timeout=10)
             startup_connection.send(("ready", ""))
             startup_connection.close()
-            try:
-                self.run_busy_loop()
-            except Exception as error:
-                self._output_queue.put(error)
-                raise
+            self.run_busy_loop()
+        except Exception as error:
+            self._output_queue.put(error)
+            raise
         finally:
             self._input_stop.set()
             self._output_queue.put(None)
             for thread in started_threads:
                 thread.join(timeout=2)
-            self.close_requested = True
-            self._handle_shutdown()
+            self.close()
 
     def _process_input_sockets(
         self, endpoint: str, client_identity: bytes, ready: Future[None]
@@ -203,11 +200,7 @@ class EngineCore:
                             )
                         except (TypeError, ValueError) as error:
                             self._output_queue.put(
-                                (
-                                    CoreErrorEvent(
-                                        request_data["request_id"], str(error)
-                                    ),
-                                )
+                                (CoreErrorEvent(request_data["request_id"], str(error)),)
                             )
                             continue
                         self._input_queue.put((request_type, request))
@@ -217,12 +210,7 @@ class EngineCore:
                     else:
                         self._input_queue.put((request_type, None))
         except Exception as error:
-            if not ready.done():
-                ready.set_exception(error)
-            else:
-                logger.exception("EngineCore input thread failed")
-                self._output_queue.put(error)
-                self._input_queue.put((EngineCoreRequestType.CLOSE, None))
+            self._handle_thread_error(error, ready)
 
     def _process_output_sockets(self, endpoint: str, ready: Future[None]) -> None:
         try:
@@ -246,47 +234,49 @@ class EngineCore:
                             }
                         )
         except Exception as error:
-            if not ready.done():
-                ready.set_exception(error)
-            else:
-                logger.exception("EngineCore output thread failed")
-                self._input_queue.put((EngineCoreRequestType.CLOSE, None))
+            self._handle_thread_error(error, ready)
+
+    def _handle_thread_error(self, error: Exception, ready: Future[None]) -> None:
+        if not ready.done():
+            ready.set_exception(error)
+        else:
+            logger.exception("EngineCore thread failed")
+            self._output_queue.put(error)
+            self._input_queue.put((EngineCoreRequestType.CLOSE, None))
 
     def add_request(self, request: EngineCoreRequest) -> None:
+        """Add a request to the scheduler after validation."""
         try:
             self._validate_request(request)
             self.scheduler.add_request(request)
-        except Exception as error:  # noqa: BLE001 - duplicate requests are isolated.
+        except (ValueError, RuntimeError) as error:
             self.reject_request(request.request_id, str(error))
 
     def reject_request(self, request_id: str, message: str) -> None:
+        """Reject a request and emit an error event."""
         logger.warning(
             "engine request rejected: request_id=%s error=%s", request_id, message
         )
         self.pending_outputs.add(CoreErrorEvent(request_id, message))
 
     def abort_requests(self, request_ids: tuple[str, ...]) -> None:
+        """Cancel running or waiting requests."""
         for request_id in request_ids:
             self.scheduler.abort(request_id)
 
     @property
     def has_work(self) -> bool:
+        """Check if scheduler or pending outputs have work."""
         return self.scheduler.has_work or bool(self.pending_outputs.outputs)
-
-    def _handle_shutdown(self) -> bool:
-        """Close the core when requested and return whether to keep running."""
-        if self.close_requested:
-            self.close()
-        return not self.closed
 
     def run_busy_loop(self) -> None:
         """Process incoming requests and step while scheduler work exists."""
-        while self._handle_shutdown():
+        while not self.close_requested and not self.closed:
             self._process_input()
             self._process_engine_step()
+        self.close()
 
     def _process_input(self) -> None:
-        """Handle queued requests until the queue is drained or close is received."""
         for queued_request in self._iter_input_requests():
             match queued_request:
                 case EngineCoreRequestType.ADD, request:
@@ -298,34 +288,33 @@ class EngineCore:
                     return
 
     def _iter_input_requests(self) -> Iterator[EngineCoreInput]:
-        """Wait for work when idle, then yield any queued requests."""
         while not self.has_work:
-            yield self._input_queue.get()
+            try:
+                yield self._input_queue.get(timeout=5)
+            except Empty:
+                return
 
         # The busy loop is the input queue's only consumer.
         while not self._input_queue.empty():
             yield self._input_queue.get_nowait()
 
     def _process_engine_step(self) -> None:
-        """Run one step and enqueue its request outputs."""
         if self.close_requested:
             return
         outputs, model_executed = self.step_fn()
-        request_outputs = outputs.get(0)
+        request_outputs = outputs.get()
         if request_outputs:
             self._output_queue.put(request_outputs)
-        self.post_step(model_executed=model_executed)
         if not model_executed and self.has_work:
             time.sleep(0.001)
 
     def step_fn(self) -> tuple[EngineCoreOutputs, bool]:
         """Run at most one scheduled model step in the caller's thread."""
-        outputs = self._take_pending_outputs()
+        outputs = self.pending_outputs
+        self.pending_outputs = EngineCoreOutputs()
         scheduler_output = self.scheduler.schedule()
         if not scheduler_output.running_requests:
             return outputs, False
-        debug_enabled = logger.isEnabledFor(logging.DEBUG)
-        step_started = time.perf_counter() if debug_enabled else 0.0
         try:
             model_output = self.executor.execute_step(scheduler_output)
             scheduler_updates = self.scheduler.update_from_output(
@@ -344,19 +333,11 @@ class EngineCore:
             for request in self.scheduler.fail_batch(scheduler_output):
                 outputs.add(CoreErrorEvent(request.request_id, str(error)))
             return outputs, True
-        if debug_enabled:
-            logger.debug(
-                "model step finished: batch_size=%d duration_ms=%.2f request_ids=%s",
-                len(scheduler_output.running_requests),
-                (time.perf_counter() - step_started) * 1000,
-                tuple(
-                    request.request_id for request in scheduler_output.running_requests
-                ),
-            )
         for scheduler_update in scheduler_updates:
             request = scheduler_update.request
             finish_reason = scheduler_update.finish_reason
             if finish_reason is not FinishReason.STOP:
+                # Don't emit token event when finish_reason is STOP
                 outputs.add(
                     CoreTokenEvent(
                         request.request_id,
@@ -367,11 +348,8 @@ class EngineCore:
                 outputs.add(self._finished_event(request, finish_reason))
         return outputs, True
 
-    def post_step(self, *, model_executed: bool) -> None:
-        """Lifecycle hook reserved for post-forward maintenance."""
-        del model_executed
-
     def close(self) -> None:
+        """Shut down scheduler and executor."""
         if self.closed:
             return
         self.closed = True
@@ -387,16 +365,16 @@ class EngineCore:
 
     def _validate_request(self, request: EngineCoreRequest) -> None:
         sampling = request.sampling_params
-        if sampling.max_tokens < 1:
-            raise ValueError("max_tokens must be positive")
-        if sampling.temperature < 0:
-            raise ValueError("temperature must not be negative")
-        if not 0 < sampling.top_p <= 1:
-            raise ValueError("top_p must be in (0, 1]")
-        if sampling.top_k is not None and sampling.top_k < 1:
-            raise ValueError("top_k must be positive")
-        if sampling.stop:
-            raise ValueError("stop strings are not supported by EngineCore")
+        validations = [
+            (sampling.max_tokens < 1, "max_tokens must be positive"),
+            (sampling.temperature < 0, "temperature must not be negative"),
+            (not 0 < sampling.top_p <= 1, "top_p must be in (0, 1]"),
+            (sampling.top_k is not None and sampling.top_k < 1, "top_k must be positive"),
+            (sampling.stop, "stop strings are not supported by EngineCore"),
+        ]
+        for condition, error_msg in validations:
+            if condition:
+                raise ValueError(error_msg)
 
     def _finished_event(
         self, request: EngineCoreRequest, finish_reason: FinishReason
@@ -408,7 +386,4 @@ class EngineCore:
             request.completion_tokens,
         )
 
-    def _take_pending_outputs(self) -> EngineCoreOutputs:
-        outputs = self.pending_outputs
-        self.pending_outputs = EngineCoreOutputs()
-        return outputs
+

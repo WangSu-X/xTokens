@@ -87,9 +87,13 @@ def main(argv: list[str] | None = None) -> None:
         * args.pipeline_parallel_size
         * args.context_parallel_size
     )
-    parallel_devices = args.parallel_device
-    if parallel_devices is None:
-        parallel_devices = [f"cuda:{index}" for index in range(parallel_world_size)]
+    parallel_devices = args.parallel_device or [
+        f"cuda:{index}" for index in range(parallel_world_size)
+    ]
+
+    block_size = args.kv_cache_block_size or KVCacheConfig().block_size
+    core_client_mode = "in_proc" if args.engine == "inproc" else "multi_proc"
+
     config = XTokensConfig(
         model_config=ModelConfig(
             served_model_name=args.served_model_name or args.model,
@@ -107,9 +111,7 @@ def main(argv: list[str] | None = None) -> None:
             local_files_only=args.local_files_only,
         ),
         kv_cache_config=KVCacheConfig(
-            block_size=args.kv_cache_block_size
-            if args.kv_cache_block_size is not None
-            else KVCacheConfig().block_size,
+            block_size=block_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
             num_gpu_blocks=args.num_gpu_blocks,
             enable_prefix_caching=not args.disable_prefix_caching,
@@ -135,7 +137,7 @@ def main(argv: list[str] | None = None) -> None:
             shutdown_policy=args.shutdown_policy,
             cors_origins=tuple(args.cors_origin),
             access_log=not args.no_access_log,
-            core_client_mode="in_proc" if args.engine == "inproc" else "multi_proc",
+            core_client_mode=core_client_mode,
         ),
     )
     uvicorn.run(

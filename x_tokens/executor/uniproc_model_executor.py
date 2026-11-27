@@ -10,8 +10,6 @@ from .worker_handle import LocalWorkerHandle
 
 class UniProcModelExecutor(ModelExecutor):
     def _init_executor(self) -> None:
-        if self.parallel_config.distributed_executor_backend != "uni":
-            raise ValueError("UniProcModelExecutor requires the uni backend")
         worker = GPUWorker(
             GPUWorkerConfig(
                 self.config,

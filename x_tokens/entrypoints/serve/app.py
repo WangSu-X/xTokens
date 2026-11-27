@@ -40,10 +40,13 @@ def create_app(config: XTokensConfig | None = None) -> FastAPI:
         engine = LLMEngine(config)
         app.state.engine = engine
         app.state.completion_service = CompletionService(engine)
-        processor = getattr(engine, "input_processor", None)
-        app.state.chat_service = ChatCompletionService(
-            engine, tokenizer=getattr(processor, "tokenizer", None)
-        )
+
+        tokenizer = None
+        if hasattr(engine, "input_processor") and hasattr(
+            engine.input_processor, "tokenizer"
+        ):
+            tokenizer = engine.input_processor.tokenizer
+        app.state.chat_service = ChatCompletionService(engine, tokenizer=tokenizer)
 
         health = await engine.health()
         if health.ready:

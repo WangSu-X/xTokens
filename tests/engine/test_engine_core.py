@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from queue import Queue
 from unittest.mock import Mock
 
@@ -85,16 +84,14 @@ def test_core_steps_kv_batches_and_returns_events_directly() -> None:
         core.add_request(request(request_id))
 
     first, executed = core.step_fn()
-    core.post_step(model_executed=executed)
     second, executed = core.step_fn()
-    core.post_step(model_executed=executed)
 
     assert executor.batches == [["one", "two"], ["one", "two"]]
-    assert first.get(0) == (
+    assert first.get() == (
         CoreTokenEvent("one", 2),
         CoreTokenEvent("two", 3),
     )
-    assert second.get(0) == (
+    assert second.get() == (
         CoreFinishedEvent("one", FinishReason.STOP, 1, 2),
         CoreTokenEvent("two", 4),
         CoreFinishedEvent("two", FinishReason.LENGTH, 1, 2),
@@ -142,23 +139,6 @@ def test_core_busy_loop_skips_step_after_close(
     shutdown.assert_called_once_with()
 
 
-def test_core_logs_model_step_timing(monkeypatch) -> None:
-    debug = Mock()
-    monkeypatch.setattr(
-        engine_core_module.logger,
-        "isEnabledFor",
-        lambda level: level == logging.DEBUG,
-    )
-    monkeypatch.setattr(engine_core_module.logger, "debug", debug)
-    core = create_core(FakeExecutor([2]))
-    core.add_request(request("timed"))
-
-    core.step_fn()
-
-    debug.assert_called_once()
-    assert debug.call_args.args[0].startswith("model step finished:")
-
-
 def test_core_emits_ignored_eos_until_request_length() -> None:
     core = create_core(FakeExecutor([9, 9]))
     core.add_request(request("eval", ignore_eos=True))
@@ -166,8 +146,8 @@ def test_core_emits_ignored_eos_until_request_length() -> None:
     first, _ = core.step_fn()
     second, _ = core.step_fn()
 
-    assert first.get(0) == (CoreTokenEvent("eval", 9),)
-    assert second.get(0) == (
+    assert first.get() == (CoreTokenEvent("eval", 9),)
+    assert second.get() == (
         CoreTokenEvent("eval", 9),
         CoreFinishedEvent("eval", FinishReason.LENGTH, 1, 2),
     )
@@ -180,9 +160,9 @@ def test_core_isolates_request_validation_errors_without_a_queue() -> None:
 
     outputs, _ = core.step_fn()
 
-    assert isinstance(outputs.get(0)[0], CoreErrorEvent)
-    assert outputs.get(0)[0].request_id == "bad"
-    assert outputs.get(0)[1] == CoreFinishedEvent("good", FinishReason.STOP, 1, 1)
+    assert isinstance(outputs.get()[0], CoreErrorEvent)
+    assert outputs.get()[0].request_id == "bad"
+    assert outputs.get()[1] == CoreFinishedEvent("good", FinishReason.STOP, 1, 1)
 
 
 def test_core_creates_scheduler_with_configured_limits() -> None:
@@ -195,7 +175,7 @@ def test_core_creates_scheduler_with_configured_limits() -> None:
 
     assert executed
     assert executor.batches == [["one"]]
-    assert outputs.get(0) == (CoreTokenEvent("one", 2),)
+    assert outputs.get() == (CoreTokenEvent("one", 2),)
 
 
 def test_core_passes_resolved_executor_cache_capacity_to_scheduler() -> None:
@@ -222,6 +202,6 @@ def test_core_model_failure_releases_kv_blocks(monkeypatch) -> None:
     outputs, executed = core.step_fn()
 
     assert executed
-    assert outputs.get(0) == (CoreErrorEvent("failed", "failed"),)
+    assert outputs.get() == (CoreErrorEvent("failed", "failed"),)
     assert core.scheduler.kv_cache_manager.stats().active_blocks == 0
     assert not core.scheduler.has_work

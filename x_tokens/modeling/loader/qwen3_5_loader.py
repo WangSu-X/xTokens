@@ -34,6 +34,32 @@ def _copy_projection(
     scales: torch.Tensor | None,
     block_size: tuple[int, int] | None,
 ) -> None:
+    """Copy weight tensor into target, handling FP8 block-scaled quantization.
+
+    For FP8-quantized weights:
+    1. Align requested bounds to tile boundaries (tile_rows × tile_columns)
+    2. Load and dequantize the aligned region to float32
+    3. Scale by per-tile scale factors (inverse scales stored in checkpoint)
+    4. Extract the originally requested slice
+
+    For dense weights (bfloat16/float16/float32):
+    1. Direct copy via bounds indexing
+
+    This two-stage process (align→dequantize→scale→slice) ensures that:
+    - FP8 tiles are decoded together (tiles are atomic quantization units)
+    - Split boundaries within tiles are handled correctly
+    - Per-rank tensor parallel shards receive properly scaled weights
+
+    Args:
+        target: Destination tensor (rank-local parameter shard)
+        source: Source tensor from checkpoint (quantized or dense)
+        bounds: Slice tuple [row_slice, col_slice] indicating which portion to copy
+        scales: Per-tile scale factors (1D or 2D, only for FP8 source)
+        block_size: (tile_rows, tile_columns) FP8 quantization block size
+
+    Raises:
+        ValueError: If FP8 matrix lacks required scales or has shape mismatch
+    """
     if source.dtype == torch.float8_e4m3fn:
         if scales is None or block_size is None or source.ndim != 2:
             raise ValueError("FP8 matrix requires per-block weight_scale_inv")
@@ -103,6 +129,37 @@ def _copy_parameter(
     block_size: tuple[int, int] | None,
     conv_segments: tuple[int, int, int],
 ) -> None:
+    """Copy and shard checkpoint weights into rank-local parameter.
+
+    Handles multiple layer types with different sharding strategies:
+
+    - VocabParallelEmbedding: Load full embedding (must be unquantized)
+    - ColumnParallelLinear: Shard by output dimension (axis=0)
+    - RowParallelLinear: Shard by input dimension (axis=1)
+    - MergedColumnParallelLinear: Multiple output sizes (e.g., QKV combined)
+    - 1D Convolution: Multiple segments (K, K, V for gated delta net)
+    - Scalar parameters (A_log, dt_bias): Per-head sharding
+
+    For tensor parallel (TP) execution:
+    1. Identify sharding axis and segments from module type
+    2. Validate source shape matches total (unsharded) parameter size
+    3. Calculate this rank's slice within each segment
+    4. Copy with FP8 dequantization if quantized
+
+    Args:
+        name: Parameter name (e.g., "model.layers.0.self_attn.q_proj.weight")
+        parameter: Local rank's parameter tensor (pre-allocated, uninitialized)
+        module: nn.Module containing the parameter (determines sharding strategy)
+        source: Full parameter from checkpoint (all ranks' shards concatenated)
+        rank: This rank's index in tensor parallel group (0 to tp-1)
+        tp: Tensor parallel world size
+        scales: Per-tile scale factors if source is FP8-quantized
+        block_size: (tile_rows, tile_columns) for FP8 quantization
+        conv_segments: (K_width, K_width, V_width) for Conv1d sharding
+
+    Raises:
+        ValueError: If embedding is quantized, or shape mismatch, or unsupported module
+    """
     if isinstance(module, VocabParallelEmbedding):
         if scales is not None or source.dtype not in _DENSE_DTYPES:
             raise ValueError(
@@ -161,6 +218,45 @@ def _copy_parameter(
 
 @torch.no_grad()
 def load_qwen3_5_weights(model: Qwen3_5ForCausalLM) -> WeightLoadReport:
+    """Load rank-local Qwen3.5 weights from safetensors checkpoint with FP8 support.
+
+    Load flow:
+    1. Build parameter manifest from checkpoint (safetensors files)
+    2. Validate that all model parameters have corresponding checkpoint weights
+    3. Flag extra/missing parameters (optional strict mode)
+    4. Group parameters by checkpoint file for efficient I/O
+    5. For each file:
+       a. Load checkpoint shard into CPU memory
+       b. Load per-tile scales if present (for FP8 quantized weights)
+       c. For each parameter: determine sharding, copy with _copy_parameter()
+    6. Return load statistics (bytes, tensor count, rank info)
+
+    FP8 Quantization:
+    - Weights may be stored as float8_e4m3fn (8-bit) with per-tile scales
+    - Scales stored as separate tensors: {param_name}_scale_inv
+    - Tiles are atomic units (cannot split across rank boundaries)
+    - On load: dequantize tile-aligned regions, then slice to rank's shard
+
+    Tensor Parallelism:
+    - Parameters are sharded by output/input dimension based on layer type
+    - Each rank loads its local shard (size ÷ tp)
+    - Collective barrier after load ensures all ranks finish before training
+
+    Args:
+        model: Qwen3_5ForCausalLM instance with load_config and distributed context
+
+    Returns:
+        WeightLoadReport: Statistics including:
+        - rank, world_size: Rank coordinates
+        - loaded_source_tensors: Count (parameters + scales)
+        - loaded_parameters: Count of model parameters initialized
+        - local_parameter_bytes: Memory consumption
+        - missing_parameters, unexpected_tensors: Validation results
+
+    Raises:
+        ValueError: If strict_weights=True and mismatches detected
+        FileNotFoundError: If checkpoint files missing
+    """
     root = model.load_config.model_path
     manifest = _load_manifest(root)
     prefix = (

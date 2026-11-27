@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from unittest.mock import Mock
 
 import pytest
@@ -227,34 +226,6 @@ def test_isolated_request_reserves_only_the_current_chunk() -> None:
     )
     assert len(second.running_requests[0].block_ids) == 3
     assert second.num_samples == 1
-
-
-def test_scheduler_logs_every_scheduled_batch(monkeypatch) -> None:
-    debug = Mock()
-    monkeypatch.setattr(
-        scheduler_module.logger,
-        "isEnabledFor",
-        lambda level: level == logging.DEBUG,
-    )
-    monkeypatch.setattr(scheduler_module.logger, "debug", debug)
-    scheduler = Scheduler(
-        kv_cache_config=KVCacheConfig(block_size=2, num_gpu_blocks=8),
-        model_fingerprint="tiny",
-        max_num_seqs=1,
-        max_model_len=8,
-    )
-    scheduler.add_request(request("one", (1,)))
-
-    scheduler.schedule()
-    scheduler.schedule()
-
-    schedule_calls = [
-        call
-        for call in debug.call_args_list
-        if call.args[0].startswith("scheduler step:")
-    ]
-    assert len(schedule_calls) == 2
-    assert all(call.args[1] == 1 for call in schedule_calls)
 
 
 def test_scheduler_finishes_on_eos_and_length() -> None:

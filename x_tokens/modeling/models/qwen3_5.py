@@ -27,6 +27,12 @@ from x_tokens.modeling.qwen3_5_config import Qwen3_5TextConfig
 from x_tokens.worker.kv_cache import GPUKVCache
 from x_tokens.worker.model_runner import GPUModelRunner
 
+# CPU fallback configuration for linear attention processing
+# When GPU kernels (flash-linear-attention) are unavailable,
+# process tokens in smaller spans to manage CPU memory and maintain
+# numerical stability during gated delta rule computation
+MAX_CPU_SPAN_LEN = 64
+
 
 class Qwen3_5Model(nn.Module):
     """Qwen3.5 text decoder that produces normalized last-token hidden states."""
@@ -252,7 +258,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             block_index, block_offset = divmod(position, block_size)
             span_len = block_size - block_offset
             if self.flash_chunk is None:
-                span_len = min(64, span_len)
+                span_len = min(MAX_CPU_SPAN_LEN, span_len)
             end = min(metadata.query_len, offset + span_len)
             span = slice(offset, end)
             output, recurrent = self._gated_delta_rule(

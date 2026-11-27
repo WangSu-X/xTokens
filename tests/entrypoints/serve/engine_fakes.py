@@ -47,9 +47,6 @@ class FakeEngineCore:
                 del self.requests[request_id]
         return tuple(request_outputs), bool(request_outputs)
 
-    def post_step(self) -> None:
-        pass
-
     def abort_requests(self, request_ids: tuple[str, ...]) -> None:
         for request_id in request_ids:
             self.requests.pop(request_id, None)
@@ -71,7 +68,6 @@ class FakeCoreClient(EngineCoreClient):
 
     async def get_output(self) -> tuple[CoreRequestOutput, ...]:
         request_outputs, _ = self.core.step_fn()
-        self.core.post_step()
         return request_outputs
 
     def abort_requests(self, request_ids: tuple[str, ...]) -> None:

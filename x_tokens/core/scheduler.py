@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections import OrderedDict, deque
 
 from x_tokens.config import KVCacheConfig
@@ -85,15 +84,6 @@ class Scheduler:
             raise ValueError("prompt exceeds max_model_len")
         self.waiting.append(request)
         self.request_ids.add(request.request_id)
-        logger.debug(
-            "scheduler request queued: request_id=%s prompt_tokens=%d "
-            "max_tokens=%d waiting=%d running=%d",
-            request.request_id,
-            request.prompt_tokens,
-            request.sampling_params.max_tokens,
-            len(self.waiting),
-            len(self.running),
-        )
 
     def abort(self, request_id: str) -> bool:
         request = self.running.pop(request_id, None)
@@ -102,9 +92,6 @@ class Scheduler:
             request.stop_reason = FinishReason.CANCELLED
             self.request_ids.discard(request_id)
             self.cache_manager.free(request_id)
-            logger.debug(
-                "scheduler request aborted: request_id=%s state=running", request_id
-            )
             return True
         for request in tuple(self.waiting):
             if request.request_id == request_id:
@@ -112,10 +99,6 @@ class Scheduler:
                 request.status = RequestStatus.ABORTED
                 request.stop_reason = FinishReason.CANCELLED
                 self.request_ids.discard(request_id)
-                logger.debug(
-                    "scheduler request aborted: request_id=%s state=waiting",
-                    request_id,
-                )
                 return True
         return False
 
@@ -193,19 +176,6 @@ class Scheduler:
             budget -= count
             admitted += 1
 
-        if logger.isEnabledFor(logging.DEBUG):
-            stats = self.cache_manager.stats()
-            logger.debug(
-                "scheduler step: batch_size=%d scheduled_tokens=%d admitted=%d "
-                "waiting=%d running=%d free_blocks=%d cached_blocks=%d",
-                len(scheduled_requests),
-                sum(num_scheduled_tokens.values()),
-                admitted,
-                len(self.waiting),
-                len(self.running),
-                stats.free_blocks,
-                stats.cached_blocks,
-            )
         return SchedulerOutput(tuple(scheduled_requests), num_scheduled_tokens)
 
     def _tokens_to_schedule(self, remaining: int, budget: int, competing: bool) -> int:
@@ -265,13 +235,6 @@ class Scheduler:
                 self.running.pop(request.request_id)
                 self.request_ids.discard(request.request_id)
                 self.cache_manager.free(request.request_id)
-                logger.debug(
-                    "scheduler request finished: request_id=%s finish_reason=%s "
-                    "completion_tokens=%d",
-                    request.request_id,
-                    request.stop_reason.value,
-                    request.completion_tokens,
-                )
             updates.append(SchedulerUpdate(request, token_id, request.stop_reason))
         return tuple(updates)
 

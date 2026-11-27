@@ -16,11 +16,9 @@ from x_tokens.entrypoints.serve.openai.protocol import (
 )
 
 
-def to_completion_response(
-    request_id: str,
-    model: str,
+def _extract_tokens_and_text(
     outputs: list[EngineEvent],
-) -> CompletionResponse:
+) -> tuple[str, int, int]:
     final_event = outputs[-1] if outputs else None
     full_text = "".join(
         event.text for event in outputs if isinstance(event, TokenEvent)
@@ -31,6 +29,16 @@ def to_completion_response(
     completion_tokens = (
         final_event.completion_tokens if isinstance(final_event, FinishedEvent) else 0
     )
+    return full_text, prompt_tokens, completion_tokens
+
+
+def to_completion_response(
+    request_id: str,
+    model: str,
+    outputs: list[EngineEvent],
+) -> CompletionResponse:
+    full_text, prompt_tokens, completion_tokens = _extract_tokens_and_text(outputs)
+    final_event = outputs[-1] if outputs else None
 
     return CompletionResponse(
         id=request_id,
@@ -61,16 +69,8 @@ def to_chat_completion_response(
     model: str,
     outputs: list[EngineEvent],
 ) -> ChatCompletionResponse:
+    full_text, prompt_tokens, completion_tokens = _extract_tokens_and_text(outputs)
     final_event = outputs[-1] if outputs else None
-    full_text = "".join(
-        event.text for event in outputs if isinstance(event, TokenEvent)
-    )
-    prompt_tokens = (
-        final_event.prompt_tokens if isinstance(final_event, FinishedEvent) else 0
-    )
-    completion_tokens = (
-        final_event.completion_tokens if isinstance(final_event, FinishedEvent) else 0
-    )
 
     return ChatCompletionResponse(
         id=request_id,

@@ -49,17 +49,15 @@ class InProcessClient(EngineCoreClient):
                 model=request.model,
                 served_model_name=self.engine_core.config.served_model_name,
             )
+            self.engine_core.add_request(core_request)
         except (TypeError, ValueError) as error:
             self.engine_core.reject_request(request.request_id, str(error))
-            return
-        self.engine_core.add_request(core_request)
 
     async def get_output(self) -> tuple[CoreRequestOutput, ...]:
         if self.closed:
             return ()
-        outputs, model_executed = self.engine_core.step_fn()
-        self.engine_core.post_step(model_executed=model_executed)
-        return outputs.get(0)
+        outputs, _ = self.engine_core.step_fn()
+        return outputs.get()
 
     def abort_requests(self, request_ids: tuple[str, ...]) -> None:
         self.engine_core.abort_requests(request_ids)
@@ -121,7 +119,7 @@ class MultiProcessClient(EngineCoreClient):
             self.input_socket.bind(input_endpoint)
             self.output_socket.bind(output_endpoint)
         except BaseException:
-            self._cleanup_transport()
+            self._cleanup()
             raise
 
         context = multiprocessing.get_context("spawn")
@@ -137,38 +135,31 @@ class MultiProcessClient(EngineCoreClient):
             ),
             name=f"xtokens-engine-core-{uuid.uuid4().hex[:8]}",
         )
-        try:
-            self.process.start()
-        except Exception:
-            parent.close()
-            child.close()
-            self._cleanup_transport()
-            raise
+        self.process.start()
         child.close()
         startup_timeout_s = max(timeout_s, config.parallel_config.timeout_s)
         if not parent.poll(startup_timeout_s):
             parent.close()
-            self._terminate_process()
+            self._cleanup(terminate=True)
             raise TimeoutError("EngineCore process startup timed out")
         try:
             status, detail = parent.recv()
         except EOFError as error:
             parent.close()
-            self._terminate_process()
+            self._cleanup(terminate=True)
             raise RuntimeError("EngineCore process exited during startup") from error
         parent.close()
         if status != "ready":
-            self._terminate_process()
+            self._cleanup(terminate=True)
             raise RuntimeError(f"EngineCore process startup failed:\n{detail}")
         try:
             identity, handshake = self.input_socket.recv_multipart()
         except self.zmq.error.Again as error:
-            self._terminate_process()
+            self._cleanup(terminate=True)
             raise TimeoutError("EngineCore input channel startup timed out") from error
         if identity != self.client_identity or handshake != b"READY":
-            self._terminate_process()
+            self._cleanup(terminate=True)
             raise RuntimeError("EngineCore input channel handshake failed")
-        self.closed = False
 
     def _send_request(
         self,
@@ -193,7 +184,7 @@ class MultiProcessClient(EngineCoreClient):
             self.input_socket.send_multipart(frames)
         except self.zmq.error.Again as error:
             self.closed = True
-            self._terminate_process()
+            self._cleanup(terminate=True)
             raise TimeoutError(
                 f"timed out sending {request_type} to EngineCore process"
             ) from error
@@ -234,12 +225,7 @@ class MultiProcessClient(EngineCoreClient):
         raise RuntimeError("MultiProcessClient is closed")
 
     def abort_requests(self, request_ids: tuple[str, ...]) -> None:
-        if (
-            request_ids
-            and not self.closed
-            and self.process is not None
-            and self.process.is_alive()
-        ):
+        if request_ids and not self.closed:
             self._send_request(
                 EngineCoreRequestType.ABORT, request_ids=list(request_ids)
             )
@@ -263,17 +249,12 @@ class MultiProcessClient(EngineCoreClient):
             self.closed = True
             if self.process is not None:
                 self.process.join(timeout=5)
-            if self.process is not None and self.process.is_alive():
-                self._terminate_process()
-            self._cleanup_transport()
+            self._cleanup(terminate=self.process is not None and self.process.is_alive())
 
-    def _terminate_process(self) -> None:
-        if self.process is not None and self.process.is_alive():
+    def _cleanup(self, *, terminate: bool = False) -> None:
+        if terminate and self.process is not None and self.process.is_alive():
             self.process.terminate()
             self.process.join(timeout=5)
-        self._cleanup_transport()
-
-    def _cleanup_transport(self) -> None:
         if self.transport_closed:
             return
         self.transport_closed = True

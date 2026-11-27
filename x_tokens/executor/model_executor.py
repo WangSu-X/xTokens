@@ -23,6 +23,7 @@ class ModelExecutor(Executor, ABC):
 
     @staticmethod
     def get_class(parallel_config: ParallelConfig) -> type[ModelExecutor]:
+        """Return the executor class for the given parallel config."""
         if parallel_config.distributed_executor_backend == "uni":
             from .uniproc_model_executor import UniProcModelExecutor
 
@@ -44,37 +45,31 @@ class ModelExecutor(Executor, ABC):
         eos_token_ids: frozenset[int] = frozenset(),
     ) -> None:
         parallel_config = config.parallel_config
-        unsupported_sizes = {
-            "pipeline_parallel_size": parallel_config.pipeline_parallel_size,
-            "context_parallel_size": parallel_config.context_parallel_size,
-        }
-        unsupported = [name for name, size in unsupported_sizes.items() if size != 1]
+        if parallel_config.pipeline_parallel_size != 1:
+            raise NotImplementedError("pipeline parallelism is not supported")
+        if parallel_config.context_parallel_size != 1:
+            raise NotImplementedError("context parallelism is not supported")
         if parallel_config.enable_expert_parallel:
-            unsupported.append("expert_parallel")
-        if unsupported:
-            raise NotImplementedError(
-                "the first ModelExecutor implementation only supports TP; "
-                f"unsupported execution modes: {', '.join(unsupported)}"
-            )
+            raise NotImplementedError("expert parallelism is not supported")
         self.config = config
         self.parallel_config = parallel_config
         self.pad_token_id = pad_token_id
         self.topology = ParallelTopology.build(parallel_config)
         self.configured_eos_token_ids = eos_token_ids
         self.num_gpu_blocks = 0
-        self.failed_error: BaseException | None = None
         self.output_rank = 0
         self.worker_handles: tuple[WorkerHandle, ...] = ()
         self._init_executor()
         try:
             self._initialize_kv_cache()
-        except BaseException:
+        except Exception:
             with suppress(Exception):
                 self.shutdown()
             raise
 
     @property
     def eos_token_ids(self) -> frozenset[int]:
+        """Return configured end-of-sequence token IDs."""
         return self.configured_eos_token_ids
 
     @abstractmethod
@@ -85,41 +80,28 @@ class ModelExecutor(Executor, ABC):
         method: str,
         *args: Any,
     ) -> tuple[Any, ...]:
-        self._raise_if_failed()
+        """Invoke a method on all workers and collect responses."""
         if not self.worker_handles:
             raise RuntimeError("model executor has no active workers")
-        try:
-            for handle in self.worker_handles:
-                handle.send(method, args)
-            responses: list[Any] = []
-            first_error: Exception | None = None
-            for handle in self.worker_handles:
-                try:
-                    responses.append(handle.recv(self.parallel_config.timeout_s))
-                except Exception as error:  # noqa: BLE001 - drain every rank response.
-                    responses.append(None)
-                    if first_error is None:
-                        first_error = error
-            if first_error is not None:
-                raise first_error
-            return tuple(responses)
-        except BaseException as error:
-            self.failed_error = error
-            raise
+        for handle in self.worker_handles:
+            handle.send(method, args)
+        responses: list[Any] = []
+        first_error: Exception | None = None
+        for handle in self.worker_handles:
+            try:
+                responses.append(handle.recv(self.parallel_config.timeout_s))
+            except Exception as error:  # noqa: BLE001 - drain every rank response.
+                responses.append(None)
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+        return tuple(responses)
 
     def execute_step(self, batch: SchedulerOutput) -> ModelRunnerOutput:
+        """Run one forward pass for the scheduled batch."""
         if not batch.running_requests:
             return ModelRunnerOutput()
-        inputs = self.prepare_worker_input(batch)
-        responses = self.collective_rpc("execute_and_sample", inputs)
-        output = responses[self.output_rank]
-        if not isinstance(output, ModelRunnerOutput):
-            raise TypeError("output rank returned an invalid model result")
-        return output
-
-    def prepare_worker_input(
-        self, batch: SchedulerOutput
-    ) -> tuple[ModelRunnerRequest, ...]:
         requests = []
         for item in batch.running_requests:
             sampling = item.sampling_params
@@ -137,21 +119,21 @@ class ModelExecutor(Executor, ABC):
                     sampling_metadata=sampling_metadata,
                 )
             )
-        return tuple(requests)
+        responses = self.collective_rpc("execute_and_sample", tuple(requests))
+        output = responses[self.output_rank]
+        if not isinstance(output, ModelRunnerOutput):
+            raise TypeError("output rank returned an invalid model result")
+        return output
 
     def check_health(self) -> None:
-        self._raise_if_failed()
+        """Verify all workers are responsive."""
         for handle in self.worker_handles:
             handle.check_health()
 
     @abstractmethod
-    def shutdown(self) -> None: ...
-
-    def _raise_if_failed(self) -> None:
-        if self.failed_error is not None:
-            raise RuntimeError(
-                "model executor is in a failed state"
-            ) from self.failed_error
+    def shutdown(self) -> None:
+        """Shut down all workers and release resources."""
+        ...
 
     def _initialize_kv_cache(self) -> None:
         kv_cache_config = self.config.kv_cache_config

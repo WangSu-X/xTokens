@@ -110,9 +110,7 @@ class LLMEngine(LLMEngineProtocol):
                     )
                     if request_output_queue is not None:
                         request_output_queue.put_nowait(request_output)
-                if core_outputs:
-                    await asyncio.sleep(0)
-                else:
+                if not core_outputs:
                     await asyncio.sleep(0.001)
         except asyncio.CancelledError:
             raise
@@ -131,6 +129,7 @@ class LLMEngine(LLMEngineProtocol):
         await asyncio.gather(output_task, return_exceptions=True)
 
     def parse_output(self, request_output: CoreRequestOutput) -> EngineEvent:
+        """Convert a Core output to an Engine event with decoded text."""
         if isinstance(request_output, CoreTokenEvent):
             text = self.output_processor.process_token(
                 request_output.request_id, request_output.token_id

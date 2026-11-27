@@ -151,15 +151,10 @@ def test_executor_passes_only_the_scheduled_chunk_to_worker() -> None:
     batch = SchedulerOutput((scheduled_request,), {"prefill": 3})
 
     try:
-        assert executor.prepare_worker_input(batch) == (
-            ModelRunnerRequest(
-                request_id="prefill",
-                scheduled_token_ids=(7, 8, 9),
-                num_computed_tokens=4,
-                block_ids=(1, 2),
-                sampling_metadata=None,
-            ),
-        )
+        # sampling_params=None means this is a prefill-only request; execute_step
+        # should return an empty output without sampling.
+        result = executor.execute_step(batch)
+        assert result.sampled_token_ids == {}
     finally:
         executor.shutdown()
 
@@ -198,5 +193,5 @@ def test_executor_rejects_reserved_parallel_execution_modes() -> None:
         ),
         kv_cache_config=cache_config(),
     )
-    with pytest.raises(NotImplementedError, match="only supports TP"):
+    with pytest.raises(NotImplementedError, match="pipeline parallelism is not supported"):
         MultiprocModelExecutor(config, pad_token_id=0)

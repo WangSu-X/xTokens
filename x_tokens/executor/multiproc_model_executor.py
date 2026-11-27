@@ -16,8 +16,6 @@ from .worker_handle import ProcessWorkerHandle
 
 class MultiprocModelExecutor(ModelExecutor):
     def _init_executor(self) -> None:
-        if self.parallel_config.distributed_executor_backend != "mp":
-            raise ValueError("MultiprocModelExecutor requires the mp backend")
         context = multiprocessing.get_context("spawn")
         init_method = f"tcp://127.0.0.1:{_free_port()}"
         handles: list[ProcessWorkerHandle] = []

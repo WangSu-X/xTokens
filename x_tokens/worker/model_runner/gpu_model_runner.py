@@ -49,6 +49,8 @@ class GPUModelRunner(ModelRunner):
         self.torch_module = torch_module
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_cache: GPUKVCache | None = None
+        # Cache tensor options to avoid repeated creation
+        self._tensor_options: dict[str, Any] | None = None
 
     def load_model(self) -> None:
         load_model = getattr(self.model, "load_model", None)
@@ -151,17 +153,45 @@ class GPUModelRunner(ModelRunner):
         self.execute_model_state = ExecuteModelState(logits, sampling_metadata)
 
     def sample_tokens(self) -> ModelRunnerOutput:
+        """Sample tokens from logits using cached sampling metadata.
+
+        Returns:
+            ModelRunnerOutput mapping request_id to sampled token_id
+        """
         state = self.execute_model_state
         self.execute_model_state = None
         if state is None:
             return ModelRunnerOutput()
-        if all(metadata.temperature == 0 for metadata in state.sampling_metadata.values()):
+
+        # Validate sampling parameters upfront
+        for request_id, metadata in state.sampling_metadata.items():
+            if metadata.temperature < 0:
+                raise ValueError(
+                    f"request {request_id}: temperature must be non-negative, "
+                    f"got {metadata.temperature}"
+                )
+            if not (0 < metadata.top_p <= 1):
+                raise ValueError(
+                    f"request {request_id}: top_p must be in (0, 1], got {metadata.top_p}"
+                )
+            if metadata.top_k is not None and metadata.top_k < 1:
+                raise ValueError(
+                    f"request {request_id}: top_k must be positive, got {metadata.top_k}"
+                )
+
+        # Fast path: all requests use greedy (temperature=0)
+        if all(
+            metadata.temperature == 0
+            for metadata in state.sampling_metadata.values()
+        ):
             token_ids = state.logits.argmax(dim=-1).tolist()
         else:
+            # Sample each request individually
             token_ids = [
                 self._sample(state.logits[index], metadata)
                 for index, metadata in enumerate(state.sampling_metadata.values())
             ]
+
         return ModelRunnerOutput(
             dict(zip(state.sampling_metadata, token_ids, strict=True))
         )
@@ -174,6 +204,29 @@ class GPUModelRunner(ModelRunner):
                 set_cache(None)
             self.kv_cache = None
 
+    def _get_tensor_options(self) -> dict[str, Any]:
+        """Get cached tensor options for long dtype tensors."""
+        if self._tensor_options is None:
+            self._tensor_options = {
+                "dtype": self.torch_module.long,
+                "device": self.context.device,
+            }
+        return self._tensor_options
+
+    def _compute_cache_slots(
+        self, request: ModelRunnerRequest, block_size: int
+    ) -> tuple[int, ...]:
+        """Compute global slot indices for a request's tokens."""
+        slots = []
+        for position in range(
+            request.num_computed_tokens,
+            request.num_computed_tokens + len(request.scheduled_token_ids),
+        ):
+            block_idx = position // block_size
+            offset = position % block_size
+            slots.append(request.block_ids[block_idx] * block_size + offset)
+        return tuple(slots)
+
     def _prepare_model_input(
         self, requests: tuple[ModelRunnerRequest, ...]
     ) -> ModelInput:
@@ -185,53 +238,81 @@ class GPUModelRunner(ModelRunner):
         masks = []
         positions = []
         cache_slots = []
+
         for request in requests:
             query_len = len(request.scheduled_token_ids)
             start = request.num_computed_tokens
             end = start + query_len
             query_positions = range(start, end)
             padding = max_length - query_len
+
+            # Pad token IDs
             padded.append(
                 [self.pad_token_id] * padding + list(request.scheduled_token_ids)
             )
+            # Attention mask
             masks.append([0] * padding + [1] * query_len)
+            # Absolute positions
             positions.append([0] * padding + list(query_positions))
-            slots = tuple(
-                request.block_ids[position // block_size] * block_size
-                + position % block_size
-                for position in query_positions
-            )
+
+            # KV cache slots (using extracted helper)
+            slots = self._compute_cache_slots(request, block_size)
             cache_slots.append(KVCacheSlots(end, request.block_ids, slots))
 
-        tensor_options = {
-            "dtype": self.torch_module.long,
-            "device": self.context.device,
-        }
+        tensor_opts = self._get_tensor_options()
         return ModelInput(
-            self.torch_module.tensor(padded, **tensor_options),
-            self.torch_module.tensor(masks, **tensor_options),
-            self.torch_module.tensor(positions, **tensor_options),
+            self.torch_module.tensor(padded, **tensor_opts),
+            self.torch_module.tensor(masks, **tensor_opts),
+            self.torch_module.tensor(positions, **tensor_opts),
             tuple(cache_slots),
         )
 
     def _sample(self, logits: Any, metadata: SamplingMetadata) -> int:
+        """Sample a token using temperature, top-k, and top-p filtering.
+
+        Filtering order:
+        1. Temperature scaling
+        2. Top-K: keep only the k largest logits
+        3. Top-P: keep tokens with cumulative probability <= p
+        """
         if metadata.temperature == 0:
             return int(self.torch_module.argmax(logits).item())
+
+        # Validate sampling parameters
+        if metadata.temperature < 0:
+            raise ValueError(f"temperature must be non-negative, got {metadata.temperature}")
+        if not (0 < metadata.top_p <= 1):
+            raise ValueError(f"top_p must be in (0, 1], got {metadata.top_p}")
+        if metadata.top_k is not None and metadata.top_k < 1:
+            raise ValueError(f"top_k must be positive, got {metadata.top_k}")
+
         scaled = logits / metadata.temperature
-        if metadata.top_k is not None:
+
+        # Top-K filtering: keep only the k largest values
+        if metadata.top_k is not None and metadata.top_k > 0:
             top_k = min(metadata.top_k, scaled.shape[-1])
-            cutoff = self.torch_module.topk(scaled, top_k).values[-1]
-            scaled = scaled.masked_fill(scaled < cutoff, float("-inf"))
-        if metadata.top_p < 1:
+            _, top_indices = self.torch_module.topk(scaled, top_k)
+            # Create mask of top-k indices
+            mask = self.torch_module.zeros_like(scaled, dtype=self.torch_module.bool)
+            mask.scatter_(0, top_indices, True)
+            scaled = scaled.masked_fill(~mask, float("-inf"))
+
+        # Top-P filtering: keep tokens with cumsum(probs) <= p
+        if metadata.top_p < 1.0:
             sorted_logits, sorted_indices = self.torch_module.sort(
                 scaled, descending=True
             )
             sorted_probs = self.torch_module.softmax(sorted_logits, dim=-1)
-            remove = self.torch_module.cumsum(sorted_probs, dim=-1) - sorted_probs
-            sorted_logits = sorted_logits.masked_fill(
-                remove > metadata.top_p, float("-inf")
+            # Cumulative sum: includes current token
+            cumsum_probs = self.torch_module.cumsum(sorted_probs, dim=-1)
+            # Keep tokens where cumsum <= top_p OR already masked (infinite)
+            keep = (cumsum_probs <= metadata.top_p) | self.torch_module.isinf(
+                sorted_logits
             )
+            sorted_logits = sorted_logits.masked_fill(~keep, float("-inf"))
+            # Scatter back to original position
             scaled = self.torch_module.full_like(scaled, float("-inf"))
             scaled.scatter_(0, sorted_indices, sorted_logits)
+
         probabilities = self.torch_module.softmax(scaled, dim=-1)
         return int(self.torch_module.multinomial(probabilities, 1).item())
